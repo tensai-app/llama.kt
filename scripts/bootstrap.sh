@@ -497,6 +497,9 @@ for file in "${files_add_lm_prefix[@]}"; do
   # the rewrite below is not idempotent (lm_ggml_ -> lm_lm_ggml_).
   [[ "$file" == "$CPP_DIR/tensai_jni.cpp" ]] && continue
 
+  # Same for our header-only helpers (tensai_utf.h, tensai_kv_reuse.h).
+  [[ "$file" == "$CPP_DIR/"tensai_* ]] && continue
+
   sed -i 's/GGML_/LM_GGML_/g' "$file"
   sed -i 's/ggml_/lm_ggml_/g' "$file"
   sed -i 's/GGUF_/LM_GGUF_/g' "$file"

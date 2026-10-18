@@ -1,0 +1,107 @@
+diff --git a/llama-kt/src/main/cpp/rn-completion.cpp b/llama-kt/src/main/cpp/rn-completion.cpp
+index 72a8f33..64e6fe9 100644
+--- a/llama-kt/src/main/cpp/rn-completion.cpp
++++ b/llama-kt/src/main/cpp/rn-completion.cpp
+@@ -3,6 +3,8 @@
+ #include "rn-tts.h"
+ #include "rn-mtmd.hpp"
+ #include "rn-common.hpp"
++#include "tensai_kv_reuse.h"
++#include "llama-context.h"  // llama_context::memory_update(), no public entry point
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -16,6 +18,27 @@
+ 
+ namespace rnllama {
+ 
++// KV reuse past a divergence (TEN-196): smallest run worth a K-shift (llama-server's
++// --cache-reuse default is 0, its docs suggest 256; a chat turn drops one think
++// block per answer, so a short run is a coincidence), and how many splices to try.
++static constexpr size_t KV_REUSE_MIN_CHUNK = 32;
++static constexpr size_t KV_REUSE_MAX_MOVES = 8;
++// A K-shift rotates the K of EVERY cell in the buffer (graph input is sized n_ctx, not
++// the moved range), so its cost scales with n_ctx while the re-prefill it saves scales
++// with the reused tokens. Reuse only pays above n_ctx / KV_REUSE_CTX_RATIO tokens.
++// Estimate, Qwen3-1.7B (28 layers, 8 KV heads x 128 = 1024 K dims, f16):
++//   FLOPs: shift ~3 flops x 28.7k elements per cell = ~86 kflop/cell, prefill ~3.4 Gflop
++//   per token: ~40k cells per token, so FLOPs say the shift is nearly free.
++//   It is memory bound instead: 28.7k elements x 2 B x (read + write) = ~115 kB per
++//   cell, 2.7 GB at n_ctx 23552, plus the worst-case graph reserve memory_update()
++//   does afterwards. Prefill amortises the weights over a whole ubatch, so a token
++//   costs far less than its flops/bandwidth ratio suggests.
++// Measured (Dimensity 900, CPU, Qwen3-1.7B, n_ctx 23552): the shift took 2.0 s (1964 ms
++// for 688 reused tokens), prefill runs 12-16 tok/s, so break-even is about 25-30 reused
++// tokens. 368 gives n_ctx / 368 = 64 tokens there, ~2.5x margin, scaling with kv size
++// like the shift does.
++static constexpr size_t KV_REUSE_CTX_RATIO = 368;
++
+ // Constructor
+ llama_rn_context_completion::llama_rn_context_completion(llama_rn_context* parent)
+     : parent_ctx(parent) {
+@@ -175,6 +198,65 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
+             }
+         }
+ 
++        // KV reuse past a divergence (TEN-196). The prefix stops where the
++        // previous answer's reasoning block was dropped by the chat template,
++        // but everything after it is still cached: shift it down instead of
++        // re-prefilling it. Same chunk loop as llama-server's --cache-reuse.
++        // Gated hard, because a K-shift on a cache that cannot shift aborts the
++        // process, and a recurrent state cannot be spliced at all (it still
++        // answers can_shift = true, so can_shift alone is not enough).
++        if (n_past > 0 && !is_enc_dec && !truncated) {
++            auto * kv_reuse = llama_get_memory(parent_ctx->ctx);
++            const size_t n_cmp = std::min(embd.size(), text_tokens.size());
++            const char * skip = nullptr;
++            if (llama_model_n_swa(parent_ctx->model) > 0) skip = "SWA";
++            else if (llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) skip = "recurrent/hybrid";
++            else if (shouldUseMTP()) skip = "MTP";
++            else if (!llama_memory_can_shift(kv_reuse)) skip = "cache cannot shift";
++            else if ((size_t)(llama_memory_seq_pos_max(kv_reuse, 0) + 1) != embd.size()) skip = "embd and KV disagree";
++            if ((size_t) n_past < n_cmp) {
++                if (skip != nullptr) {
++                    LOG_INFO("kv reuse: skipped (%s)", skip);
++                } else {
++                    const auto moves = tensai_kv::plan_kv_reuse(
++                        std::vector<int32_t>(embd.begin(), embd.end()),
++                        std::vector<int32_t>(text_tokens.begin(), text_tokens.end()),
++                        (size_t) n_past, KV_REUSE_MIN_CHUNK, KV_REUSE_MAX_MOVES);
++                    const size_t gain = tensai_kv::kv_reuse_gain(moves);
++                    const size_t min_gain = std::max(KV_REUSE_MIN_CHUNK, (size_t) llama_n_ctx(parent_ctx->ctx) / KV_REUSE_CTX_RATIO);
++                    if (moves.empty()) {
++                        // pure append or nothing worth moving: the common prefix is all there is
++                    } else if (gain < min_gain) {
++                        LOG_INFO("kv reuse: skipped (gain %zu < threshold %zu)", gain, min_gain);
++                    } else {
++                        bool ok = true;
++                        for (const auto & m : moves) {
++                            LOG_INFO("kv reuse: dropped %d tokens at %d, reused %d", m.src - m.dst, m.dst, m.len);
++                            ok = llama_memory_seq_rm(kv_reuse, 0, m.dst, m.src);
++                            if (!ok) break;
++                            llama_memory_seq_add(kv_reuse, 0, m.src, m.src + m.len, m.dst - m.src);
++                        }
++                        if (!ok) {
++                            LOG_WARNING("kv reuse: seq_rm refused, full re-prefill");
++                            llama_memory_clear(kv_reuse, false);
++                            n_past = 0;
++                        } else {
++                            // Apply the shift now instead of inside the next decode: it is
++                            // timed on its own, and no state save can catch the cache
++                            // between the cell move and the K rotation. The same call
++                            // llama_decode() makes first thing; there is no public entry.
++                            const int64_t t0 = lm_ggml_time_us();
++                            parent_ctx->ctx->memory_update(false);
++                            LOG_INFO("kv reuse: shift applied in %.1f ms (kv size %u, %zu tokens reused)",
++                                (lm_ggml_time_us() - t0) / 1000.0, llama_n_ctx(parent_ctx->ctx), gain);
++                            // The tokens now in the cache up to here are the prompt's own.
++                            n_past = moves.back().dst + moves.back().len;
++                        }
++                    }
++                }
++            }
++        }
++
+         embd = text_tokens;
+         if (n_past == num_prompt_tokens) {
+             // we have to evaluate at least 1 token to generate logits.
