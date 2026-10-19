@@ -220,6 +220,9 @@ class LlamaEngine {
      * [chatTemplate]: chat template to use instead of the GGUF's own: null or empty →
      *   the file's, "chatml" / "mistral" / "llama3" / "gemma" / "phi3" → that format, any other
      *   string → taken as a Jinja template source.
+     * [nBatch] / [nUbatch]: logical / physical batch size, 0 (default) keeps llama.cpp's
+     *   (2048 / 512).
+     * [typeK] / [typeV]: KV cache type for one side, null keeps what [kvCacheType] gives.
      * Throws [IllegalStateException] if the native load fails or is aborted.
      */
     fun load(
@@ -232,6 +235,10 @@ class LlamaEngine {
         flashAttn: String? = null,
         chatTemplate: String? = null,
         nThreadsBatch: Int = 0,
+        nBatch: Int = 0,
+        nUbatch: Int = 0,
+        typeK: String? = null,
+        typeV: String? = null,
     ) {
         val policy = if (nThreads == 0) {
             ThreadPolicy.resolve(ThreadPolicy.readCoreSpeeds())
@@ -252,6 +259,7 @@ class LlamaEngine {
         }
         handle = nativeLoadModel(
             path, nGpuLayers, nCtx, resolved, resolvedBatch, onProgress, kvCacheType, flashAttn, chatTemplate,
+            nBatch, nUbatch, typeK, typeV,
         )
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
@@ -432,6 +440,7 @@ class LlamaEngine {
     private external fun nativeLoadModel(
         path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int, nThreadsBatch: Int,
         progressCb: LoadProgressCallback?, kvCacheType: String?, flashAttn: String?, chatTemplate: String?,
+        nBatch: Int, nUbatch: Int, typeK: String?, typeV: String?,
     ): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
@@ -524,6 +533,16 @@ class LlamaEngine {
         fun kvShapeVersion(): Long = nativeKvShapeVersion()
 
         /**
+         * setenv() each "KEY=VALUE" entry in the process. ggml-vulkan reads its `LM_GGML_VK_*`
+         * variables once, when the backend registry first initialises, so call this before any
+         * other call that lists backends or loads a model. Changing a value afterwards needs a
+         * process restart.
+         */
+        fun setEnv(entries: List<String>) {
+            if (entries.isNotEmpty()) nativeSetEnv(entries.toTypedArray())
+        }
+
+        /**
          * llama.cpp's own system info string, e.g.
          * `CPU : NEON = 1 | ARM_FMA = 1 | DOTPROD = 1 | ...`: the CPU features ggml-cpu was
          * built with and detected at runtime. Static, no model needed. Empty when the native
@@ -557,6 +576,9 @@ class LlamaEngine {
 
         @JvmStatic
         private external fun nativeKvShapeVersion(): Long
+
+        @JvmStatic
+        private external fun nativeSetEnv(entries: Array<String>)
 
         /**
          * Count the "big" cores of a big.LITTLE SoC, see [ThreadPolicy.bigCoreCount].

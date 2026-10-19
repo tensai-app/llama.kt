@@ -17,6 +17,8 @@
 
 #include <jni.h>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <random>
@@ -985,7 +987,11 @@ static jlong loadModel_impl(
         jobject progressCb,
         jstring kvCacheType,
         jstring flashAttn,
-        jstring chatTemplate)
+        jstring chatTemplate,
+        jint nBatch,
+        jint nUbatch,
+        jstring typeK,
+        jstring typeV)
 {
     // Owned rather than raw: loadModel() below runs llama.cpp's whole model
     // loader, which throws on a file it can't make sense of, and the context
@@ -1000,6 +1006,9 @@ static jlong loadModel_impl(
     p.n_gpu_layers = static_cast<int32_t>(nGpuLayers);
     p.n_ctx        = static_cast<int32_t>(nCtx > 0 ? nCtx : 4096);
     if (p.n_batch <= 0) p.n_batch = 512;
+    // Overrides (VulkanTuning): <= 0 keeps the common_params defaults.
+    if (nBatch > 0)  p.n_batch  = static_cast<int32_t>(nBatch);
+    if (nUbatch > 0) p.n_ubatch = static_cast<int32_t>(nUbatch);
 
     // A CPU load keeps every GPU out of the context (TEN-182). llama.cpp lists all GPU devices
     // whatever n_gpu_layers is, so the Vulkan backend was still in the scheduler and its op offload
@@ -1033,6 +1042,12 @@ static jlong loadModel_impl(
         p.cache_type_k = rnllama::kv_cache_type_from_str(kv_type);
         p.cache_type_v = rnllama::kv_cache_type_from_str(kv_type);
     }
+
+    // Per-side KV types win over the shared kvCacheType above.
+    const std::string type_k = jstring_to_std(env, typeK);
+    const std::string type_v = jstring_to_std(env, typeV);
+    if (!type_k.empty()) p.cache_type_k = rnllama::kv_cache_type_from_str(type_k);
+    if (!type_v.empty()) p.cache_type_v = rnllama::kv_cache_type_from_str(type_v);
 
     // Flash attention: "on"/"off"; anything else keeps AUTO
     const std::string fa = jstring_to_std(env, flashAttn);
@@ -1078,7 +1093,9 @@ static jlong loadModel_impl(
         }
     }
 
+    const auto load_t0 = std::chrono::steady_clock::now();
     const bool ok = rnctx->loadModel(p);
+    const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_t0).count();
     // rnctx keeps a copy of p: drop the pointers into this stack frame.
     rnctx->params.load_progress_callback = nullptr;
     rnctx->params.load_progress_callback_user_data = nullptr;
@@ -1092,7 +1109,12 @@ static jlong loadModel_impl(
         return 0L;
     }
 
-    LOGI("loadModel OK, ptr=%p", rnctx);
+    LOGI("loadModel OK, ptr=%p load_ms=%.0f", rnctx, load_ms);
+    LOGI("load params: n_batch=%u n_ubatch=%u flash_attn=%s type_k=%s type_v=%s n_gpu_layers=%d load_ms=%.0f",
+         llama_n_batch(rnctx->ctx), llama_n_ubatch(rnctx->ctx),
+         llama_flash_attn_type_name(rnctx->params.flash_attn_type),
+         lm_ggml_type_name(rnctx->params.cache_type_k), lm_ggml_type_name(rnctx->params.cache_type_v),
+         p.n_gpu_layers, load_ms);
     // What the context really got (not what was asked) and what the CPU backend can use: a Q4_K
     // prefill that runs far below the expected tok/s is a build without dotprod/repack, or threads
     // that never reached the context (TEN-182).
@@ -1115,15 +1137,46 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jobject progressCb,
         jstring kvCacheType,
         jstring flashAttn,
-        jstring chatTemplate)
+        jstring chatTemplate,
+        jint nBatch,
+        jint nUbatch,
+        jstring typeK,
+        jstring typeV)
 {
     // 0 is the handle value the Kotlin side already reads as "load failed".
     return jni_guard("nativeLoadModel",
                      [&] {
                          return loadModel_impl(env, path, nGpuLayers, nCtx, nThreads, nThreadsBatch,
-                                               progressCb, kvCacheType, flashAttn, chatTemplate);
+                                               progressCb, kvCacheType, flashAttn, chatTemplate,
+                                               nBatch, nUbatch, typeK, typeV);
                      },
                      [] { return (jlong) 0; });
+}
+
+// ---------------------------------------------------------------------------
+// nativeSetEnv  (static)
+// ---------------------------------------------------------------------------
+// setenv() for "K=V" entries. ggml-vulkan reads its LM_GGML_VK_* variables when the backend
+// registry first initialises (instance and device init), so this must run before any other native
+// call that touches the registry; later changes are not seen.
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeSetEnv(
+        JNIEnv* env,
+        jclass /* clazz */,
+        jobjectArray entries)
+{
+    if (entries == nullptr) return;
+    const jsize n = env->GetArrayLength(entries);
+    for (jsize i = 0; i < n; i++) {
+        auto js = static_cast<jstring>(env->GetObjectArrayElement(entries, i));
+        const std::string kv = jstring_to_std(env, js);
+        env->DeleteLocalRef(js);
+        const auto eq = kv.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        setenv(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), 1);
+        LOGI("vk env: %s", kv.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------

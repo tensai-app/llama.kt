@@ -6032,7 +6032,38 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
         const uint32_t compute_queue_family_index = lm_ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = lm_ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
 
-        const float priorities[] = { 1.0f, 1.0f };
+        // Tensai: LM_GGML_VK_QUEUE_PRIORITY=low|medium|high|realtime sets the global queue priority
+        // (VK_KHR/EXT_global_priority, below) and the per-process queue priority. Unset = unchanged.
+        float priorities[] = { 1.0f, 1.0f };
+        int32_t requested_global_priority = 0;
+        const char * queue_priority_env = getenv("LM_GGML_VK_QUEUE_PRIORITY");
+        if (queue_priority_env != nullptr) {
+            const std::string qp = queue_priority_env;
+            float local_priority = 1.0f;
+            if (qp == "low") {
+                requested_global_priority = VK_QUEUE_GLOBAL_PRIORITY_LOW;
+                local_priority = 0.0f;
+            } else if (qp == "medium") {
+                requested_global_priority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM;
+                local_priority = 0.5f;
+            } else if (qp == "high") {
+                requested_global_priority = VK_QUEUE_GLOBAL_PRIORITY_HIGH;
+            } else if (qp == "realtime") {
+                requested_global_priority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME;
+            } else {
+                LM_GGML_LOG_WARN("vk: LM_GGML_VK_QUEUE_PRIORITY=%s not understood, ignored\n", queue_priority_env);
+            }
+            if (requested_global_priority != 0) {
+                priorities[0] = priorities[1] = local_priority;
+            }
+        }
+        LM_GGML_LOG_INFO("vk: device %s, vendor 0x%04x, device 0x%04x, driver api %u.%u.%u\n",
+            device->physical_device.getProperties().deviceName.data(),
+            device->physical_device.getProperties().vendorID, device->physical_device.getProperties().deviceID,
+            VK_API_VERSION_MAJOR(device->physical_device.getProperties().apiVersion),
+            VK_API_VERSION_MINOR(device->physical_device.getProperties().apiVersion),
+            VK_API_VERSION_PATCH(device->physical_device.getProperties().apiVersion));
+        LM_GGML_LOG_INFO("vk: queue priority (pQueuePriorities) = %.2f\n", priorities[0]);
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
 
         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
@@ -6458,12 +6489,91 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
 #endif
         device->name = LM_GGML_VK_NAME + std::to_string(idx);
 
-        device_create_info
-            .setFlags(vk::DeviceCreateFlags())
-            .setQueueCreateInfos(device_queue_create_infos)
-            .setPEnabledExtensionNames(device_extensions);
+        // Tensai: global queue priority. Kept out of the load's failure path: any problem falls back
+        // to the stock queues.
+        const char * global_priority_ext = nullptr;
+        for (const auto& properties : ext_props) {
+            if (strcmp(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME, properties.extensionName) == 0) {
+                global_priority_ext = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+                break;
+            }
+            if (strcmp(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME, properties.extensionName) == 0) {
+                global_priority_ext = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+            }
+        }
+        LM_GGML_LOG_INFO("vk: global_priority ext=%s\n", global_priority_ext != nullptr ? global_priority_ext : "none");
+        bool global_priority_supported_by_family = false;
+        // The priorities query struct is core in Vulkan 1.4 and an alias of VK_KHR_global_priority's; an
+        // EXT-only driver (our Mali) is not required to answer it, so it is only asked when KHR is in use.
+        const bool global_priority_queryable = global_priority_ext != nullptr &&
+            strcmp(global_priority_ext, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0;
+        if (global_priority_ext != nullptr && !global_priority_queryable) {
+            LM_GGML_LOG_INFO("vk: global priorities: not queryable (EXT)\n");
+            global_priority_supported_by_family = true;  // rely on create + retry
+        }
+        if (global_priority_queryable) {
+            std::vector<vk::QueueFamilyGlobalPriorityProperties> gp_props(queue_family_props.size());
+            std::vector<vk::QueueFamilyProperties2> qfp2(queue_family_props.size());
+            for (size_t i = 0; i < qfp2.size(); i++) {
+                qfp2[i].pNext = &gp_props[i];
+            }
+            uint32_t qfp2_count = (uint32_t) qfp2.size();
+            device->physical_device.getQueueFamilyProperties2(&qfp2_count, qfp2.data());
+            const uint32_t gp_families[] = { compute_queue_family_index, transfer_queue_family_index };
+            for (uint32_t fam : gp_families) {
+                if (fam >= gp_props.size()) continue;
+                std::string list;
+                for (uint32_t k = 0; k < gp_props[fam].priorityCount && k < VK_MAX_GLOBAL_PRIORITY_SIZE; k++) {
+                    const int32_t pr = (int32_t) gp_props[fam].priorities[k];
+                    list += std::to_string(pr) + " ";
+                    if (fam == compute_queue_family_index && pr == requested_global_priority) {
+                        global_priority_supported_by_family = true;
+                    }
+                }
+                LM_GGML_LOG_INFO("vk: queue family %u global priorities: %s(128=low 256=medium 512=high 1024=realtime)\n", fam, list.empty() ? "unknown " : list.c_str());
+            }
+            // A driver that reports nothing for the family: still try, the retry below catches a refusal.
+            if (gp_props.size() > compute_queue_family_index && gp_props[compute_queue_family_index].priorityCount == 0) {
+                global_priority_supported_by_family = true;
+            }
+        }
+
+        VkDeviceQueueGlobalPriorityCreateInfo global_priority_info{};
+        global_priority_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO;
+        global_priority_info.globalPriority = (VkQueueGlobalPriority) requested_global_priority;
+        const bool use_global_priority = requested_global_priority != 0 && global_priority_ext != nullptr && global_priority_supported_by_family;
+        if (requested_global_priority != 0 && global_priority_ext == nullptr) {
+            LM_GGML_LOG_WARN("vk: global priority not supported, ignored\n");
+        } else if (requested_global_priority != 0 && !global_priority_supported_by_family) {
+            LM_GGML_LOG_WARN("vk: global priority %d not offered by the compute queue family, ignored\n", requested_global_priority);
+        }
+
+        device_create_info.setFlags(vk::DeviceCreateFlags());
         device_create_info.setPNext(&device_features2);
-        device->device = device->physical_device.createDevice(device_create_info);
+        auto try_create_device = [&](bool with_global_priority) {
+            std::vector<const char *> exts = device_extensions;
+            for (auto & qci : device_queue_create_infos) {
+                qci.pNext = with_global_priority ? &global_priority_info : nullptr;
+            }
+            if (with_global_priority) {
+                exts.push_back(global_priority_ext);
+            }
+            device_create_info
+                .setQueueCreateInfos(device_queue_create_infos)
+                .setPEnabledExtensionNames(exts);
+            return device->physical_device.createDevice(device_create_info);
+        };
+        if (use_global_priority) {
+            try {
+                device->device = try_create_device(true);
+                LM_GGML_LOG_INFO("vk: queue global priority = %s\n", queue_priority_env);
+            } catch (const vk::SystemError& e) {
+                LM_GGML_LOG_WARN("vk: queue global priority %s refused (%s), retrying without it\n", queue_priority_env, e.what());
+                device->device = try_create_device(false);
+            }
+        } else {
+            device->device = try_create_device(false);
+        }
 
         // Load device-level function pointers.  On Android/Mali the loader does NOT
         // return device functions from vkGetInstanceProcAddr — init(instance) only
@@ -16344,6 +16454,25 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
+    // Tensai: LM_GGML_VK_SUBMIT_MFLOPS pins the work per submit (in MFLOP), no doubling. The stock
+    // 200 GFLOP cap is seconds of GPU time on a Mali, during which the compositor gets no slot.
+    // Non-numeric (or trailing garbage) disables it; a number is clamped to 1..1000000 MFLOP.
+    static const uint64_t submit_mflops_override = []() -> uint64_t {
+        const char * e = getenv("LM_GGML_VK_SUBMIT_MFLOPS");
+        if (e == nullptr || *e == '\0') {
+            return 0;
+        }
+        char * end = nullptr;
+        const unsigned long long v = std::strtoull(e, &end, 10);
+        if (end == e || *end != '\0') {
+            return 0;
+        }
+        return std::min<unsigned long long>(std::max<unsigned long long>(v, 1), 1000000);
+    }();
+    if (submit_mflops_override != 0) {
+        flops_per_submit = submit_mflops_override * 1'000'000ULL;
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -16600,7 +16729,7 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
             first_node_in_batch = true;
             submitted_nodes = 0;
             batch_flops = 0;
-            if (submit_count < 3) {
+            if (submit_count < 3 && submit_mflops_override == 0) {
                 flops_per_submit *= 2;
             }
             submit_count++;
