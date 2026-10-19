@@ -64,7 +64,7 @@ What the numbers say for this device class (UMA, no GPU matrix cores):
 ## Install (git submodule)
 
 ```bash
-git submodule add https://github.com/hokanosekai/llama.kt libs/llama.kt
+git submodule add https://github.com/tensai-app/llama.kt libs/llama.kt
 git -C libs/llama.kt submodule update --init --recursive
 bash libs/llama.kt/scripts/bootstrap.sh        # vendors llama.cpp sources (required before first build)
 ```
