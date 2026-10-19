@@ -8,7 +8,7 @@ index 599d60c..3d13183 100644
  
 +    // Tensai: LM_GGML_VK_SUBMIT_MFLOPS pins the work per submit (in MFLOP), no doubling. The stock
 +    // 200 GFLOP cap is seconds of GPU time on a Mali, during which the compositor gets no slot.
-+    // Non-numeric (or trailing garbage) disables it; a number is clamped to 1..1000000 MFLOP.
++    // Negative, non-numeric (or trailing garbage) disables it; a number is clamped to 1..1000000 MFLOP.
 +    static const uint64_t submit_mflops_override = []() -> uint64_t {
 +        const char * e = getenv("LM_GGML_VK_SUBMIT_MFLOPS");
 +        if (e == nullptr || *e == '\0') {
@@ -16,7 +16,7 @@ index 599d60c..3d13183 100644
 +        }
 +        char * end = nullptr;
 +        const unsigned long long v = std::strtoull(e, &end, 10);
-+        if (end == e || *end != '\0') {
++        if (*e == '-' || end == e || *end != '\0') {
 +            return 0;
 +        }
 +        return std::min<unsigned long long>(std::max<unsigned long long>(v, 1), 1000000);

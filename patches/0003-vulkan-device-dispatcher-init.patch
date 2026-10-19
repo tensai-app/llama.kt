@@ -1,10 +1,8 @@
 diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-index 6b29b38..c69901f 100644
+index 29af7a4..599d60c 100644
 --- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
 +++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-@@ -6227,6 +6227,21 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
-         device_create_info.setPNext(&device_features2);
-         device->device = device->physical_device.createDevice(device_create_info);
+@@ -6467,2 +6467,17 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
  
 +        // Load device-level function pointers.  On Android/Mali the loader does NOT
 +        // return device functions from vkGetInstanceProcAddr — init(instance) only
@@ -22,5 +20,3 @@ index 6b29b38..c69901f 100644
 +        }
 +
          // Queues
-         lm_ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
- 
