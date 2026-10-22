@@ -2,7 +2,7 @@
 
 Kotlin/Android JNI binding for [llama.cpp](https://github.com/ggml-org/llama.cpp). Loads any GGUF model and runs inference on-device — no server, no cloud. The native C++ engine is extracted from [llama.rn](https://github.com/mybigday/llama.rn) (React Native binding), stripped of the RN layer and re-exposed through a plain Kotlin API.
 
-Built as the inference layer for the tensai app, but usable standalone.
+Built as the inference layer for the [tensai](https://tensai.page) app, but usable standalone. Overview, measurements and patch status: [tensai.page/llama-kt](https://tensai.page/llama-kt/).
 
 ## Status
 
