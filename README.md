@@ -224,6 +224,10 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0003-vulkan-device-dispatcher-init.patch`: loads device-level Vulkan function pointers after `createDevice` (the Android loader only fills instance-level ones), and turns off `buffer_device_address` when the driver advertises it without exposing `vkGetBufferDeviceAddress` (Mali).
 - `0004-stale-embd-kv-invariant.patch`: `rn-completion.cpp` never trusts KV cells that were not decoded (embd vs KV position check, SWA window guard, embd trimmed on abort) (TEN-114).
 - `0005-load-stage-callback.patch`: `common.{h,cpp}` gain `common_params::load_stage_callback`, fired at WEIGHTS / CONTEXT / WARMUP inside `common_init_from_params`; `tensai_jni.cpp` turns it into `LoadProgressCallback.onStage` (TEN-123).
+- `0006-kv-reuse-past-divergence.patch`: `rn-completion.cpp` keeps the KV cache up to the point where a new prompt diverges from the cached one, instead of dropping it, so a follow-up after a removed reasoning block does not re-prefill the whole history.
+- `0007-vulkan-submit-mflops-env.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_SUBMIT_MFLOPS` to pin the work per Vulkan submit (in MFLOP), instead of the stock doubling.
+- `0008-vulkan-queue-priority.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_QUEUE_PRIORITY=low|medium|high|realtime` and sets the global priority of the compute queue, so a low-priority prefill leaves the GPU to the compositor.
+- `0009-vulkan-matmul-split.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_MATMUL_SPLIT_MFLOPS` and splits large matmuls along M into dispatches of that size, so the compositor can run between them on mobile GPUs that only preempt between dispatches. Off when unset or 0; results are identical to the unsplit path.
 
 ## Roadmap
 
