@@ -5,6 +5,7 @@
 #include "rn-common.hpp"
 #include "tensai_kv_reuse.h"
 #include "llama-context.h"  // llama_context::memory_update(), no public entry point
+#include "llama-kv-cache.h"  // llama_kv_cache::get_has_shift(), same
 
 #include <algorithm>
 #include <cstring>
@@ -243,10 +244,27 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
                             // llama_decode() makes first thing; there is no public entry.
                             const int64_t t0 = lm_ggml_time_us();
                             parent_ctx->ctx->memory_update(false);
-                            LOG_INFO("kv reuse: shift applied in %.1f ms (kv size %u, %zu tokens reused)",
-                                (lm_ggml_time_us() - t0) / 1000.0, llama_n_ctx(parent_ctx->ctx), gain);
-                            // The tokens now in the cache up to here are the prompt's own.
-                            n_past = moves.back().dst + moves.back().len;
+                            // memory_update() returns true even when the K-shift graph failed
+                            // (abortCallback() on a Stop, or no room to allocate it): the cells
+                            // then keep their new positions with unrotated K, and the pending
+                            // shift stays set. The graph may also have stopped between layers,
+                            // so retrying could rotate some layers twice. Drop every moved cell
+                            // instead: they all sit at or past the first dst, and the seq_rm
+                            // below removes them. Cells under it had a zero shift, untouched.
+                            const auto * kv_cells = dynamic_cast<const llama_kv_cache *>(kv_reuse);
+                            if (kv_cells == nullptr || kv_cells->get_has_shift()) {
+                                if (kv_cells == nullptr) {
+                                    LOG_WARNING("kv reuse: memory is not a llama_kv_cache, shift cannot be checked");
+                                }
+                                n_past = moves.front().dst;
+                                LOG_WARNING("kv reuse: shift failed, re-prefilling %zu tokens",
+                                    text_tokens.size() - (size_t) n_past);
+                            } else {
+                                LOG_INFO("kv reuse: shift applied in %.1f ms (kv size %u, %zu tokens reused)",
+                                    (lm_ggml_time_us() - t0) / 1000.0, llama_n_ctx(parent_ctx->ctx), gain);
+                                // The tokens now in the cache up to here are the prompt's own.
+                                n_past = moves.back().dst + moves.back().len;
+                            }
                         }
                     }
                 }
