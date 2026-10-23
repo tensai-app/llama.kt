@@ -121,7 +121,8 @@ class LlamaEngine {
     fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String
     fun tokenize(text: String): IntArray
     fun kvUsed(): Int                 // KV cache cells used = context budget
-    fun interrupt()                   // cancels an in-flight generation (incl. prefill)
+    fun interrupt()                   // cancels an in-flight generation (incl. prefill); sticky
+    fun resetInterrupt()              // clears it: call before every direct completion()/prefill()
     fun saveSession(path: String): Int
     fun loadSession(path: String): Int
     fun availableBackends(): List<BackendInfo>   // static device enumeration
@@ -179,6 +180,8 @@ fun LlamaEngine.decode(prompt: String, params: SamplingParams = SamplingParams()
 
 Generation stops on the model's EOS token or after `SamplingParams.nPredict` tokens (hard cap against runaway generation). Sampling defaults match llama.cpp; `temperature = 0` gives reproducible greedy output. Flows run on `Dispatchers.Default`; collecting on the main thread is safe.
 
+**Cancellation**: `interrupt()` is sticky. It stays pending until `resetInterrupt()`, so it also stops a call that has not started decoding yet, and every call after it. `decode()` / `chat()` handle it: they reset before starting, cancelling the collector interrupts the decode in flight, and a flow that ends on its own leaves nothing pending. When calling `completion()` or `prefill()` directly: reset first, then do your own last cancellation check, then call: an interrupt anywhere after the reset then stops that call.
+
 Native llama.cpp/ggml logs (including `GGML_ABORT` assert messages) are forwarded to logcat under the `llama.cpp` tag, so native crashes are diagnosable from `adb logcat`.
 
 **Multi-turn chat**: call `chat()` with the full growing message list every turn — the engine reuses the evaluated history from its KV cache (common-prefix matching) and only decodes the new suffix. Measured over 4 dependent turns (history 0 → 529 tokens): TTFT stays 1.7–2.4s where a full re-prefill would take ~48s. No manual cache management needed. The token stream is UTF-8 safe: multi-byte characters split across tokens (emoji, accents, CJK) are held back until complete.
@@ -229,6 +232,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0008-vulkan-queue-priority.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_QUEUE_PRIORITY=low|medium|high|realtime` and sets the global priority of the compute queue, so a low-priority prefill leaves the GPU to the compositor.
 - `0009-vulkan-matmul-split.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_MATMUL_SPLIT_MFLOPS` and splits large matmuls along M into dispatches of that size, so the compositor can run between them on mobile GPUs that only preempt between dispatches. Off when unset or 0; results are identical to the unsplit path.
 - `0010-no-prompt-token-log.patch`: `rn-completion.cpp` no longer logs every prompt token id at INFO. The ids decode back to the prompt with the model's vocabulary, and the line reached logcat in release builds.
+- `0011-sticky-interrupt-decode-failed.patch`: `rn-completion.{h,cpp}`: `is_interrupted` becomes a `std::atomic<bool>` that `rewind()` no longer clears (only `nativeResetInterrupt` does, so a stop landing before the decode starts is not erased), and a `llama_decode()` error sets `decode_failed`, which `nativeCompletion` reports as -1 instead of a finished reply. On the MTP path an abort (`ret == 2`) ends the completion like an interrupt and any other error sets `decode_failed`, instead of throwing.
 
 ## Roadmap
 

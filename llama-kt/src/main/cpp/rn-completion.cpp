@@ -56,12 +56,16 @@ llama_rn_context_completion::~llama_rn_context_completion() {
 // See declaration in rn-completion.h for why this exists (TEN-17).
 bool llama_rn_context_completion::abortCallback(void *data) {
     auto *comp = static_cast<llama_rn_context_completion *>(data);
-    return comp != nullptr && comp->is_interrupted;
+    // Relaxed: a flag poll, it orders nothing else, and this runs once per graph node.
+    return comp != nullptr && comp->is_interrupted.load(std::memory_order_relaxed);
 }
 
 void llama_rn_context_completion::rewind() {
     resetSpeculative();
-    is_interrupted = false;
+    // is_interrupted is deliberately left alone: see its declaration. The
+    // embedding() and rerank() paths, unused by llama.kt, rewind too and
+    // now inherit a pending interrupt instead of dropping it.
+    decode_failed = false;
     parent_ctx->params.antiprompt.clear();
     parent_ctx->params.sampling.grammar = {};
     parent_ctx->params.sampling.grammar_lazy = false;
@@ -473,7 +477,20 @@ void llama_rn_context_completion::evalMTPPrompt() {
 
         const int ret = llama_decode(parent_ctx->ctx, spec_batch);
         if (ret != 0) {
-            throw std::runtime_error("failed to evaluate MTP prompt batch, ret=" + std::to_string(ret));
+            // 2 is an abort by abortCallback(), ie an interrupt, not a failure. Anything else is
+            // reported through decode_failed like the non-MTP path, not thrown: a throw reached
+            // Kotlin as a decode error, a reasoning-budget stop included. The batches before this
+            // one are committed, the one in flight was rolled back by llama_decode().
+            if (ret == 2) {
+                LOG_INFO("MTP prompt eval interrupted (offset: %zu)", offset);
+            } else {
+                LOG_ERROR("failed to evaluate MTP prompt batch, ret=%d", ret);
+                decode_failed = true;
+            }
+            spec_n_past = (llama_pos) offset;
+            n_past = spec_n_past;
+            has_next_token = false;
+            return;
         }
         if (!common_speculative_process(spec, spec_batch)) {
             throw std::runtime_error("failed to process MTP prompt batch");
@@ -550,7 +567,15 @@ bool llama_rn_context_completion::refillMTPTokens() {
 
     const int ret = llama_decode(parent_ctx->ctx, spec_batch);
     if (ret != 0) {
-        throw std::runtime_error("failed to evaluate MTP target batch, ret=" + std::to_string(ret));
+        // Same split as evalMTPPrompt(). n_past stays at spec_n_past, the last accepted token.
+        if (ret == 2) {
+            LOG_INFO("MTP decode interrupted (n_past: %d)", spec_n_past);
+        } else {
+            LOG_ERROR("failed to evaluate MTP target batch, ret=%d", ret);
+            decode_failed = true;
+        }
+        has_next_token = false;
+        return false;
     }
     if (!common_speculative_process(spec, spec_batch)) {
         throw std::runtime_error("failed to process MTP target batch");
@@ -620,6 +645,10 @@ completion_token_output llama_rn_context_completion::nextTokenMTP() {
 
     if (spec == nullptr) {
         initMTP();
+        // Prompt eval interrupted or failed: evalMTPPrompt() already ended the completion.
+        if (!has_next_token) {
+            return result;
+        }
     }
     startGenerationTiming();
 
@@ -716,6 +745,9 @@ completion_token_output llama_rn_context_completion::nextToken()
                     parent_ctx->params.cpuparams.n_threads,
                     tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
                 );
+                // Leaving with has_next_token = false and tok = -1 is also how an EOS
+                // ends: without this the caller reports a finished reply.
+                decode_failed = true;
             }
             // Invariant: embd never runs ahead of the KV (n_past) when we leave.
             if (n_past < (llama_pos) embd.size()) {

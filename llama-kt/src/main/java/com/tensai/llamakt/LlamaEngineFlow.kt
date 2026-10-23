@@ -1,10 +1,13 @@
 package com.tensai.llamakt
 
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 
 /**
  * Stream completion tokens as a [Flow].
@@ -16,17 +19,42 @@ import kotlinx.coroutines.flow.flowOn
  * [params] controls generation length and sampling — see [SamplingParams].
  * The nPredict cap is a hard stop against infinite generation.
  *
- * The flow runs on [Dispatchers.Default]. Cancellation automatically
- * calls [LlamaEngine.interrupt] via [awaitClose].
+ * The flow runs on [Dispatchers.Default]. Cancelling the collector calls
+ * [LlamaEngine.interrupt], which ends the native decode early; the flow
+ * completes once it has returned.
  */
 fun LlamaEngine.decode(
     prompt: String,
     params: SamplingParams = SamplingParams(),
+): Flow<String> = interruptibleCompletion(
+    resetInterrupt = ::resetInterrupt,
+    interrupt = ::interrupt,
+) { callback -> completion(prompt, params, callback) }
+
+/**
+ * [decode]'s body over the three engine calls it makes, so it can be tested without the native
+ * library. The blocking [completion] runs in its own coroutine, so the flow reaches `awaitClose`
+ * at once and a cancel interrupts the decode in flight: run inline, it held the flow until the
+ * decode had ended on its own. [resetInterrupt] clears what the previous decode left, before the
+ * last cancellation check, so a cancel landing after that check is never erased. [interrupt] only
+ * fires on a decode still running: one fired after a normal end would stay pending, the interrupt
+ * being sticky.
+ */
+internal fun interruptibleCompletion(
+    resetInterrupt: () -> Unit,
+    interrupt: () -> Unit,
+    completion: (TokenCallback) -> Int,
 ): Flow<String> = callbackFlow {
     val callback = TokenCallback { token -> trySend(token) }
-    completion(prompt, params, callback)
-    close()
-    awaitClose { interrupt() }
+    val returned = AtomicBoolean(false)
+    launch {
+        resetInterrupt()
+        ensureActive()
+        completion(callback)
+        returned.set(true)
+        close()
+    }
+    awaitClose { if (!returned.get()) interrupt() }
 }.flowOn(Dispatchers.Default)
 
 /**

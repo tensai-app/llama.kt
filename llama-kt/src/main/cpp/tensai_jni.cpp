@@ -17,6 +17,7 @@
 
 #include <jni.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <map>
@@ -36,6 +37,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama-arch.h"
+#include "tensai_completion_result.h"
 #include "tensai_utf.h"
 #include "tensai_chat_templates.hpp"
 
@@ -1219,7 +1221,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // tokens), and for a partial stop-sequence match — so a callback can cover
 // several tokens, or none. Under-counting there reads as a Complete reply on
 // a decode that was cut off mid-sentence. Zero on every early exit: nothing
-// was generated.
+// was generated. -1 when llama_decode() failed mid-way (tensai_completion_result.h).
 
 // One line with llama.cpp's own timing of the decode that just ended: prompt eval (prefill) and
 // token generation, each as tokens and tokens/s. n_p_eval counts the tokens actually decoded, so
@@ -1563,6 +1565,12 @@ static jint completion_impl(
     // truncate generated_text itself).
     size_t stop_trim_pos = std::string::npos;
 
+    // A stop that landed after the caller's nativeResetInterrupt, the prompt copy and
+    // tokenisation included: the flag is no longer cleared on entry, so it holds here.
+    if (comp->is_interrupted) {
+        LOGI("nativeCompletion: interrupted before the first decode, nothing generated");
+    }
+
     while (comp->has_next_token && !comp->is_interrupted) {
         const size_t generated_before = comp->generated_text.size();
         rnllama::completion_token_output tok_out = comp->doCompletion();
@@ -1652,7 +1660,8 @@ static jint completion_impl(
         // (a strict parse would reject the open reasoning block and lose the split).
         const bool truncated = !comp->is_interrupted && !comp->stopped_eos && !comp->stopped_word
                             && (comp->stopped_limit || comp->context_full);
-        const bool unfinished = comp->is_interrupted || truncated;
+        // A failed decode is unfinished too: no tool calls out of a reply cut by an error.
+        const bool unfinished = comp->is_interrupted || truncated || comp->decode_failed;
         emit_parse(/* is_partial */ unfinished, /* is_final */ true);
 
         // Final outcome for nativeChatResult(). A reply the parser rejects comes back as raw
@@ -1683,7 +1692,14 @@ static jint completion_impl(
     // entry and doCompletion() is the only thing that raises it, so this is the
     // decode's own count and nothing else's.
     log_perf("nativeCompletion", rnctx);
-    return static_cast<jint>(comp->num_tokens_predicted);
+    // -1 on a failed llama_decode(), for the same reason as the jni_guard fallback below.
+    const bool interrupted = comp->is_interrupted;
+    if (comp->decode_failed && !interrupted) {
+        LOGE("nativeCompletion: llama_decode failed after %zu tokens, reporting a failure",
+             comp->num_tokens_predicted);
+    }
+    return static_cast<jint>(tensai_completion::return_value(
+        comp->num_tokens_predicted, comp->decode_failed, interrupted));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1762,8 +1778,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
 //
 // Interruption: the same is_interrupted flag as a completion (nativeInterrupt),
 // checked between n_batch chunks and, on the CPU backend, between graph nodes.
-// rewind() clears the flag on entry, so a caller must not interrupt *before*
-// this is entered and expect it to stick (same window nativeCompletion has).
+// Sticky, like for a completion: only nativeResetInterrupt clears it, so the
+// caller resets before its last cancellation check and any interrupt after that
+// point holds, one landing before the first chunk included.
 //
 // TEN-92's invariant, restated for this entry point: embd must never be ahead
 // of n_past when this returns, whatever the way out. Three ways out leave it
@@ -1855,7 +1872,9 @@ static jint prefill_impl(
     // Restored when this function is left, however it is left. See PREFILL_CHUNK_TOKENS.
     scoped_n_batch chunking(rnctx, PREFILL_CHUNK_TOKENS);
     llama_perf_context_reset(rnctx->ctx);
-    comp->nextToken();
+    // Already interrupted: not even one chunk. The abort callback would end it on the CPU
+    // backend, but a GPU backend never consults it and would decode a whole chunk first.
+    if (!comp->is_interrupted) comp->nextToken();
     comp->has_next_token = false;
     const bool complete = comp->n_past >= static_cast<llama_pos>(target);
     trim_embd_to_n_past(comp);
@@ -2133,8 +2152,32 @@ Java_com_tensai_llamakt_LlamaEngine_nativeInterrupt(
     if (h == 0L) return;
     auto* rnctx = to_ctx(h);
     if (rnctx->completion != nullptr) {
-        rnctx->completion->is_interrupted = true;
+        rnctx->completion->is_interrupted.store(true, std::memory_order_release);
         LOGI("nativeInterrupt: is_interrupted set");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// nativeResetInterrupt
+// ---------------------------------------------------------------------------
+// The only thing that clears is_interrupted. rewind() used to, on entry to every
+// completion and prefill, after the JNI call had started: an interrupt landing
+// between the caller's last cancellation check and that rewind() was erased, and
+// the decode ran to EOS or n_predict with nobody reading it. The caller resets
+// first, then checks for cancellation, then decodes, so an interrupt after the
+// check always holds. Called from the engine thread, between two decodes.
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeResetInterrupt(
+        JNIEnv* /* env */,
+        jobject /* thiz */,
+        jlong h)
+{
+    if (h == 0L) return;
+    auto* rnctx = to_ctx(h);
+    if (rnctx->completion != nullptr
+        && rnctx->completion->is_interrupted.exchange(false, std::memory_order_acq_rel)) {
+        LOGI("nativeResetInterrupt: cleared a pending interrupt");
     }
 }
 

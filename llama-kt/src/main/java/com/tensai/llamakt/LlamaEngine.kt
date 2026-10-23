@@ -275,8 +275,21 @@ class LlamaEngine {
     /** Number of tokens currently occupying the KV cache (sequence 0). */
     fun kvUsed(): Int = nativeKvCacheUsedCells(handle)
 
-    /** Interrupt an in-progress completion. Safe to call from any thread. */
+    /**
+     * Interrupt an in-progress [completion] or [prefill]. Safe to call from any thread.
+     *
+     * Sticky: the interrupt stays pending until [resetInterrupt], so it also stops a call that has
+     * not started decoding yet, and every one after it. Callers reset before starting a decode.
+     */
     fun interrupt() = nativeInterrupt(handle)
+
+    /**
+     * Clear a pending [interrupt]. Call it before your last cancellation check, then start the
+     * [completion] or [prefill]: an interrupt landing anywhere after the reset then stops that call,
+     * one that arrives before its first decode included. Never while a decode runs: it would drop an
+     * interrupt meant for that decode.
+     */
+    fun resetInterrupt() = nativeResetInterrupt(handle)
 
     /**
      * Save the current KV-cache + prompt state to [path].
@@ -372,6 +385,9 @@ class LlamaEngine {
      * This is a blocking call — run it from a background thread or
      * use the [decode] Flow extension which handles that automatically.
      *
+     * Call [resetInterrupt] first: [interrupt] is sticky, and one left pending by an earlier
+     * call (or by a [decode] flow that was cancelled) stops this one before its first token.
+     *
      * [chatParseCallback] — optional, and only useful when [prompt] came from
      *   [formatChat]: streams the same reply already split into answer and
      *   reasoning by llama.cpp's chat parser. See [ChatParseCallback] for when
@@ -386,9 +402,10 @@ class LlamaEngine {
      *   callback can carry several tokens. `0` when the completion could not
      *   start at all.
      *
-     *   **Negative means the native side failed**, and is not a count: a C++
-     *   exception escaped the decode and `tensai_jni.cpp`'s JNI guard turned it
-     *   into a value rather than letting it kill the process. Callers must test
+     *   **Negative means the native side failed**, and is not a count: `llama_decode`
+     *   returned an error, or a C++ exception escaped the decode and
+     *   `tensai_jni.cpp`'s JNI guard turned it into a value rather than letting it
+     *   kill the process. Callers must test
      *   for that before comparing against [SamplingParams.nPredict] — `-1` is
      *   below every cap, so a comparison would read a crashed decode as a reply
      *   the model chose to end. Any tokens already streamed to [callback] stay
@@ -413,7 +430,8 @@ class LlamaEngine {
      * Decode [prompt] into the KV cache without generating anything, [completion] up to
      * and including its prefill, and not a token further. Blocking, like [completion]: it
      * holds the calling thread for as long as the prefill takes (minutes, for a long
-     * prompt on a phone), and [interrupt] ends it between chunks.
+     * prompt on a phone), and [interrupt] ends it between chunks. Call [resetInterrupt]
+     * first, as for [completion]: a pending interrupt stops it before the first chunk.
      *
      * Goes through the same prefix reuse as [completion]: whatever the cache already holds
      * of [prompt]'s leading tokens is kept, the rest is dropped and decoded. The cache is
@@ -461,6 +479,7 @@ class LlamaEngine {
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int
     private external fun nativeInterrupt(h: Long)
+    private external fun nativeResetInterrupt(h: Long)
     private external fun nativeSaveSession(h: Long, path: String): Int
     private external fun nativeLoadSession(h: Long, path: String): Int
 

@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 #include "chat.h"
 #include "speculative.h"
+#include <atomic>
 #include <deque>
 
 using json = nlohmann::ordered_json;
@@ -58,8 +59,16 @@ struct llama_rn_context_completion {
 
     // Completion state fields
     bool is_predicting = false;
-    bool is_interrupted = false;
+    // Written by nativeInterrupt from any thread, read on the decode thread and by
+    // abortCallback() from the ggml CPU workers: atomic, not a plain bool. Sticky:
+    // rewind() no longer clears it, only nativeResetInterrupt does, which the caller
+    // runs before its last cancellation check. Cleared on entry, an interrupt landing
+    // between that check and the native call was erased and the decode ran to the end.
+    std::atomic<bool> is_interrupted{false};
     bool has_next_token = false;
+    // llama_decode() failed for a reason other than an abort (nextToken()). Reset by
+    // rewind(). Without it a failed decode ended like an EOS and read as a finished reply.
+    bool decode_failed = false;
     std::string prefill_text;
     std::string generated_text;
     utf8_stream_gate utf8_gate;
