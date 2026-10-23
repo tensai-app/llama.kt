@@ -228,6 +228,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0007-vulkan-submit-mflops-env.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_SUBMIT_MFLOPS` to pin the work per Vulkan submit (in MFLOP), instead of the stock doubling.
 - `0008-vulkan-queue-priority.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_QUEUE_PRIORITY=low|medium|high|realtime` and sets the global priority of the compute queue, so a low-priority prefill leaves the GPU to the compositor.
 - `0009-vulkan-matmul-split.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_MATMUL_SPLIT_MFLOPS` and splits large matmuls along M into dispatches of that size, so the compositor can run between them on mobile GPUs that only preempt between dispatches. Off when unset or 0; results are identical to the unsplit path.
+- `0010-no-prompt-token-log.patch`: `rn-completion.cpp` no longer logs every prompt token id at INFO. The ids decode back to the prompt with the model's vocabulary, and the line reached logcat in release builds.
 
 ## Roadmap
 

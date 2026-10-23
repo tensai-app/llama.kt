@@ -138,14 +138,6 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, add_bos || is_enc_dec, true);
         num_prompt_tokens = text_tokens.size();
 
-        // LOG tokens
-        std::stringstream ss;
-        ss << "\n" << __func__ << ": prompt_tokens = ";
-        for (auto& token : text_tokens) {
-            ss << token << " ";
-        }
-        LOG_INFO("%s\n", ss.str().c_str());
-
         if (parent_ctx->params.n_keep < 0) {
             parent_ctx->params.n_keep = (int)num_prompt_tokens;
         }
