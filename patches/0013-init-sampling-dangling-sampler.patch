@@ -1,0 +1,14 @@
+diff --git a/llama-kt/src/main/cpp/rn-completion.cpp b/llama-kt/src/main/cpp/rn-completion.cpp
+index e99cfd9..4ded2fe 100644
+--- a/llama-kt/src/main/cpp/rn-completion.cpp
++++ b/llama-kt/src/main/cpp/rn-completion.cpp
+@@ -102,6 +102,9 @@ void llama_rn_context_completion::rewind() {
+ bool llama_rn_context_completion::initSampling() {
+     if (ctx_sampling != nullptr) {
+         common_sampler_free(ctx_sampling);
++        // common_sampler_init() throws on a grammar that does not parse: the
++        // freed sampler must not stay behind to be freed again.
++        ctx_sampling = nullptr;
+     }
+     ctx_sampling = common_sampler_init(parent_ctx->model, parent_ctx->params.sampling);
+     return ctx_sampling != nullptr;

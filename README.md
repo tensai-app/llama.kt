@@ -159,6 +159,7 @@ data class SamplingParams(
     val stopSequences: List<String> = emptyList(),  // never emitted to the stream
     val repeatPenalty: Float = 1.0f,  // 1.0 = disabled; generated tokens only, applied before top_k/top_p/min_p/temp
     val repeatLastN: Int = 64,       // window for repeatPenalty (0 or negative = off)
+    val constrainToolCalls: Boolean = true, // a tool call the model opens must fit the offered tools' schemas (lazy grammar)
 )
 
 data class ChatMessage(val role: String, val content: String)
@@ -234,6 +235,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0010-no-prompt-token-log.patch`: `rn-completion.cpp` no longer logs every prompt token id at INFO. The ids decode back to the prompt with the model's vocabulary, and the line reached logcat in release builds.
 - `0011-sticky-interrupt-decode-failed.patch`: `rn-completion.{h,cpp}`: `is_interrupted` becomes a `std::atomic<bool>` that `rewind()` no longer clears (only `nativeResetInterrupt` does, so a stop landing before the decode starts is not erased), and a `llama_decode()` error sets `decode_failed`, which `nativeCompletion` reports as -1 instead of a finished reply. On the MTP path an abort (`ret == 2`) ends the completion like an interrupt and any other error sets `decode_failed`, instead of throwing.
 - `0012-kv-reuse-shift-failure.patch`: `rn-completion.cpp` checks that the K-shift of a KV reuse (0006) really ran: when it failed (a Stop aborts its graph, or it could not be allocated), the moved cells are dropped and re-prefilled instead of being kept with their new positions and unrotated K.
+- `0013-init-sampling-dangling-sampler.patch`: `rn-completion.cpp`'s `initSampling()` forgets the sampler it frees before building the next one, so a `common_sampler_init()` that throws (a grammar that does not parse, LKT-48) no longer leaves a freed pointer for the retry or the destructor to free again.
 
 ## Roadmap
 

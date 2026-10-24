@@ -33,6 +33,13 @@ import org.json.JSONObject
  *   from [LlamaEngine.formatChat] and to a model whose chat template delimits
  *   reasoning — it is silently ignored otherwise, since there is no tag to
  *   force. Independent of [nPredict], which still caps the decode as a whole.
+ * [constrainToolCalls]: once the model opens a tool call, every token has to fit
+ *   the template's call syntax with one of the offered tools and arguments its
+ *   schema allows (llama.cpp's lazy grammar, triggered by the template's call
+ *   marker). Text before the marker, reasoning included, is never constrained.
+ *   Only applies to a [prompt] from [LlamaEngine.formatChatWithTools] whose
+ *   template has a call marker; ignored otherwise. Default on; off samples calls
+ *   unconstrained, as before, for comparison.
  *
  * Defaults match llama.cpp's common_params_sampling.
  */
@@ -46,6 +53,7 @@ data class SamplingParams(
     val reasoningBudgetTokens: Int = -1,
     val repeatPenalty: Float = 1.0f,
     val repeatLastN: Int = 64,
+    val constrainToolCalls: Boolean = true,
 )
 
 /**
@@ -422,6 +430,7 @@ class LlamaEngine {
         params.temperature, params.topK, params.topP, params.minP,
         params.repeatPenalty, params.repeatLastN,
         params.stopSequences.toTypedArray(),
+        params.constrainToolCalls,
         callback,
         chatParseCallback,
     )
@@ -467,6 +476,7 @@ class LlamaEngine {
         temperature: Float, topK: Int, topP: Float, minP: Float,
         repeatPenalty: Float, repeatLastN: Int,
         stopSequences: Array<String>,
+        constrainToolCalls: Boolean,
         cb: TokenCallback,
         cbChat: ChatParseCallback?,
     ): Int

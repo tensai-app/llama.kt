@@ -38,6 +38,7 @@
 #include "gguf.h"
 #include "llama-arch.h"
 #include "tensai_completion_result.h"
+#include "tensai_tool_grammar.h"
 #include "tensai_utf.h"
 #include "tensai_chat_templates.hpp"
 
@@ -121,12 +122,18 @@ static void load_error_note(const char* text) {
 }
 
 static void tensai_log_callback(lm_ggml_log_level level, const char* text, void* /* user_data */) {
+    // DEBUG lines are dropped, with the CONT lines that carry on one: some
+    // quote generated text (the lazy grammar logs every piece and the whole
+    // tool call it constrains, LKT-48), and logcat reaches release builds.
+    // Same policy as patch 0010. Per thread, like the lines it follows.
+    static thread_local bool in_debug = false;
+    if (level != LM_GGML_LOG_LEVEL_CONT) in_debug = level == LM_GGML_LOG_LEVEL_DEBUG;
+    if (in_debug) return;
     if (level == LM_GGML_LOG_LEVEL_ERROR) load_error_note(text);
     int prio;
     switch (level) {
         case LM_GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
         case LM_GGML_LOG_LEVEL_WARN:  prio = ANDROID_LOG_WARN;  break;
-        case LM_GGML_LOG_LEVEL_DEBUG: prio = ANDROID_LOG_DEBUG; break;
         default:                      prio = ANDROID_LOG_INFO;  break;
     }
     __android_log_print(prio, "llama.cpp", "%s", text);
@@ -338,6 +345,9 @@ struct chat_parse_state {
     // Tools made it into the prompt: the streaming parse then also reports the calls being
     // written (ChatParseCallback.toolCalls), and says so even before it has anything to show.
     bool                    has_tools = false;
+    // Grammar of the tool-call syntax the same template resolution produced (LKT-48), empty
+    // without tools. Installed by nativeCompletion() unless the caller turned it off.
+    tensai_tool_grammar::tool_grammar tool_grammar;
     bool                    has_result = false;
     bool                    tool_parse_failed = false;
     bool                    truncated = false;
@@ -1263,6 +1273,7 @@ static jint completion_impl(
         jfloat  repeatPenalty,
         jint    repeatLastN,
         jobjectArray stopSequences,
+        jboolean constrainToolCalls,
         jobject cb,
         jobject cbChat)
 {
@@ -1371,7 +1382,31 @@ static jint completion_impl(
     rnctx->params.sampling.reasoning_budget_end.clear();
     rnctx->params.sampling.reasoning_budget_forced.clear();
 
-    if (reasoningBudgetTokens >= 0) {
+    // LKT-48: the tool-call grammar, see tensai_tool_grammar.h. Decided first
+    // because a lazy one needs the reasoning sampler below even without a
+    // budget. rewind() has just cleared the grammar fields.
+    const llama_vocab* grammar_vocab = llama_model_get_vocab(rnctx->model);
+    const bool grammar_installed = constrainToolCalls == JNI_TRUE && chat_state_applies
+        && tensai_tool_grammar::install(rnctx->params.sampling, chat_state.tool_grammar,
+                                        chat_state.generation_prompt,
+                                        [&](const std::string& word, std::string& piece) {
+                                            return tensai_tool_grammar::leading_added_token(grammar_vocab, word, piece);
+                                        });
+    const bool lazy_grammar = grammar_installed && rnctx->params.sampling.grammar_lazy;
+    if (grammar_installed) {
+        const auto& triggers = rnctx->params.sampling.grammar_triggers;
+        const auto n_token = std::count_if(triggers.begin(), triggers.end(), [](const common_grammar_trigger& t) {
+            return t.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+        });
+        LOGI("nativeCompletion: tool-call grammar installed, lazy=%d triggers=%zu (%d token) grammar=%zu chars",
+             lazy_grammar, triggers.size(), (int) n_token,
+             chat_state.tool_grammar.grammar.size());
+    } else if (chat_state_applies && !chat_state.tool_grammar.grammar.empty()) {
+        LOGI("nativeCompletion: tool-call grammar not installed (%s)",
+             constrainToolCalls == JNI_TRUE ? "lazy without trigger" : "turned off by the caller");
+    }
+
+    if (tensai_tool_grammar::needs_reasoning_sampler(reasoningBudgetTokens, lazy_grammar)) {
         // Both tags are needed: without an end tag there is nothing to force,
         // and common_sampler_init() skips the sampler outright without a start
         // sequence to arm on.
@@ -1379,6 +1414,9 @@ static jint completion_impl(
                                && !chat_state.thinking_end_tag.empty()) {
             const llama_vocab* vocab = llama_model_get_vocab(rnctx->model);
             auto& sp = rnctx->params.sampling;
+            // -1 when only the lazy grammar asked for the sampler:
+            // common_sampler_init() still builds it for a lazy grammar, with an
+            // unlimited budget, so it tracks the block and never forces it shut.
             sp.reasoning_budget_tokens = static_cast<int32_t>(reasoningBudgetTokens);
             sp.reasoning_budget_start  = common_tokenize(vocab, chat_state.thinking_start_tag, false, true);
             sp.reasoning_budget_end    = common_tokenize(vocab, chat_state.thinking_end_tag, false, true);
@@ -1398,13 +1436,28 @@ static jint completion_impl(
                  sp.reasoning_budget_tokens,
                  chat_state.thinking_start_tag.c_str(), sp.reasoning_budget_start.size(),
                  chat_state.thinking_end_tag.c_str(),   sp.reasoning_budget_end.size());
-        } else {
+        } else if (reasoningBudgetTokens >= 0) {
             LOGI("nativeCompletion: reasoning budget=%d ignored, this prompt has no reasoning delimiters",
                  (int) reasoningBudgetTokens);
         }
     }
 
-    if (!comp->initSampling()) {
+    // A grammar that does not build must not cost the turn: the reply parser
+    // still reads a call without it, so log and sample unconstrained. Without a
+    // grammar a throw goes to jni_guard as before.
+    bool sampling_ok = false;
+    try {
+        sampling_ok = comp->initSampling();
+    } catch (const std::exception& e) {
+        if (!grammar_installed) throw;
+        LOGE("nativeCompletion: initSampling threw (%s)", e.what());
+    }
+    if (!sampling_ok && grammar_installed) {
+        LOGE("nativeCompletion: tool-call grammar rejected, sampling without it");
+        tensai_tool_grammar::clear(rnctx->params.sampling);
+        sampling_ok = comp->initSampling();
+    }
+    if (!sampling_ok) {
         LOGE("nativeCompletion: initSampling failed");
         env->DeleteLocalRef(cbClass);
         if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
@@ -1571,9 +1624,37 @@ static jint completion_impl(
         LOGI("nativeCompletion: interrupted before the first decode, nothing generated");
     }
 
+    // LKT-48: once fired, the grammar is fed the tokens that matched its trigger
+    // again, whole, and llama_grammar_accept_token() throws when one carries
+    // something the grammar does not allow ("\n```" after "<tool_call>").
+    // That throw lands in nextToken() between sampling and accepting, before
+    // the token reaches embd or generated_text, so the decode can go on: drop
+    // the grammar, rebuild the sampler and sample that step again, instead of
+    // ending the turn as an error. Once only, and not on the MTP path, whose
+    // drafts are already decoded by then. e.what() quotes the token: not logged.
+    bool grammar_live = grammar_installed;
+
     while (comp->has_next_token && !comp->is_interrupted) {
         const size_t generated_before = comp->generated_text.size();
-        rnllama::completion_token_output tok_out = comp->doCompletion();
+        rnllama::completion_token_output tok_out;
+        try {
+            tok_out = comp->doCompletion();
+        } catch (const std::runtime_error&) {
+            if (!grammar_live || comp->shouldUseMTP()) throw;
+            grammar_live = false;
+            LOGE("nativeCompletion: tool grammar: dropped mid-decode");
+            auto& sp = rnctx->params.sampling;
+            tensai_tool_grammar::clear(sp);
+            // The trigger only fires outside the reasoning block, so the decode
+            // is past it: a rebuilt reasoning sampler would restart from the
+            // generation prompt and could count the answer against the budget.
+            sp.reasoning_budget_tokens = -1;
+            sp.reasoning_budget_start.clear();
+            sp.reasoning_budget_end.clear();
+            sp.reasoning_budget_forced.clear();
+            if (!comp->initSampling()) throw std::runtime_error("initSampling failed after dropping the tool grammar");
+            continue;
+        }
 
         if (tok_out.tok == -1) {
             break;
@@ -1717,6 +1798,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jfloat  repeatPenalty,
         jint    repeatLastN,
         jobjectArray stopSequences,
+        jboolean constrainToolCalls,
         jobject cb,
         jobject cbChat)
 {
@@ -1738,7 +1820,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
                                                 reasoningBudgetTokens, temperature,
                                                 topK, topP, minP,
                                                 repeatPenalty, repeatLastN, stopSequences,
-                                                cb, cbChat);
+                                                constrainToolCalls, cb, cbChat);
                      },
                      [&] {
                          if (prompt_started && h != 0L && to_ctx(h)->completion != nullptr
@@ -1983,6 +2065,7 @@ static jstring formatChat_impl(
         state.reasoning_format  = COMMON_REASONING_FORMAT_AUTO;
         state.generation_prompt = params.generation_prompt;
         state.parser            = params.parser;
+        state.tool_grammar      = {params.grammar, params.grammar_lazy, params.grammar_triggers};
         // TEN-85: only meaningful when the template actually reasons — the
         // tags are left over from a previous variant otherwise, and a budget
         // built on them would arm against markers this prompt can't produce.
