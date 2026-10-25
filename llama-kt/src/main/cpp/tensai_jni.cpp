@@ -158,6 +158,16 @@ JNI_OnLoad(JavaVM* /* vm */, void* /* reserved */) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// e.what() fit for logcat. nlohmann parse errors end in "; last read: '...'",
+// the text being lexed: generated tool-call arguments (chat parse) or a chat
+// message (template rendering). Cut there; logcat reaches release builds.
+static std::string loggable_what(const std::exception& e) {
+    std::string what = e.what();
+    const size_t cut = what.find("; last read");
+    if (cut != std::string::npos) what.resize(cut);
+    return what;
+}
+
 // C++ exception barrier for the JNI boundary (TEN-91).
 //
 // A C++ exception is not a Java exception. Unwinding out of a native frame
@@ -197,7 +207,7 @@ static auto jni_guard(const char* fn, F&& body, G&& on_throw) -> decltype(body()
     try {
         return body();
     } catch (const std::exception& e) {
-        LOGE("%s: C++ exception at the JNI boundary: %s", fn, e.what());
+        LOGE("%s: C++ exception at the JNI boundary: %s", fn, loggable_what(e).c_str());
     } catch (...) {
         LOGE("%s: unknown C++ exception at the JNI boundary", fn);
     }
@@ -1541,7 +1551,7 @@ static jint completion_impl(
             // stream is unaffected, the caller just gets no split for this
             // reply and falls back to whatever it does without one.
             if (!parse_failed_logged) {
-                LOGE("nativeCompletion: chat parse failed (%s) — reasoning split unavailable", e.what());
+                LOGE("nativeCompletion: chat parse failed (%s), reasoning split unavailable", loggable_what(e).c_str());
                 parse_failed_logged = true;
             }
             return;
@@ -2090,9 +2100,9 @@ static jstring formatChat_impl(
         // Some templates fail under jinja — fall back to the legacy path
         // (no thinking control there).
         if (!tools.empty()) {
-            LOGE("nativeFormatChat: tools rendering failed, tools dropped (legacy renderer has none): %s", e.what());
+            LOGE("nativeFormatChat: tools rendering failed, tools dropped (legacy renderer has none): %s", loggable_what(e).c_str());
         }
-        LOGE("nativeFormatChat: jinja failed (%s), falling back to legacy", e.what());
+        LOGE("nativeFormatChat: jinja failed (%s), falling back to legacy", loggable_what(e).c_str());
         // No common_chat_params on that path, so nothing to parse the reply
         // with: drop any state a previous call left behind rather than apply a
         // stale parser to this prompt's output.
@@ -2108,7 +2118,7 @@ static jstring formatChat_impl(
             // params.chat_template, so a forced template (TEN-159) is kept here too.
             formatted = rnctx->getFormattedChat(msgs, "");
         } catch (const std::exception& e2) {
-            LOGE("nativeFormatChat: exception: %s", e2.what());
+            LOGE("nativeFormatChat: exception: %s", loggable_what(e2).c_str());
             return env->NewStringUTF("");
         }
     }

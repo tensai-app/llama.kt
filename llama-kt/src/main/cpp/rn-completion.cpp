@@ -760,11 +760,14 @@ completion_token_output llama_rn_context_completion::nextToken()
                 // undeclared cells remain and recomputes those positions.
                 LOG_INFO("Decoding Interrupted mid-eval (n_past: %d, n_eval: %d)", n_past, n_eval);
             } else {
-                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
+                // Counters only: the remaining tokens decode back to the prompt, and
+                // this line reaches logcat in release builds (patch 0014).
+                LOG_ERROR("failed to eval, ret: %d, n_eval: %d, n_past: %d, embd.size: %zu, n_threads: %d",
+                    decode_ret,
                     n_eval,
                     n_past,
-                    parent_ctx->params.cpuparams.n_threads,
-                    tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
+                    embd.size(),
+                    parent_ctx->params.cpuparams.n_threads
                 );
                 // Leaving with has_next_token = false and tok = -1 is also how an EOS
                 // ends: without this the caller reports a finished reply.

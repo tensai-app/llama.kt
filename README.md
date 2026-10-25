@@ -236,6 +236,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0011-sticky-interrupt-decode-failed.patch`: `rn-completion.{h,cpp}`: `is_interrupted` becomes a `std::atomic<bool>` that `rewind()` no longer clears (only `nativeResetInterrupt` does, so a stop landing before the decode starts is not erased), and a `llama_decode()` error sets `decode_failed`, which `nativeCompletion` reports as -1 instead of a finished reply. On the MTP path an abort (`ret == 2`) ends the completion like an interrupt and any other error sets `decode_failed`, instead of throwing.
 - `0012-kv-reuse-shift-failure.patch`: `rn-completion.cpp` checks that the K-shift of a KV reuse (0006) really ran: when it failed (a Stop aborts its graph, or it could not be allocated), the moved cells are dropped and re-prefilled instead of being kept with their new positions and unrotated K.
 - `0013-init-sampling-dangling-sampler.patch`: `rn-completion.cpp`'s `initSampling()` forgets the sampler it frees before building the next one, so a `common_sampler_init()` that throws (a grammar that does not parse, LKT-48) no longer leaves a freed pointer for the retry or the destructor to free again.
+- `0014-no-prompt-text-decode-failure-log.patch`: `rn-completion.cpp`'s "failed to eval" error logs counters (return code, n_eval, n_past, embd size) instead of the remaining prompt as text, which reached logcat in release builds. Same policy as 0010.
 
 ## Roadmap
 
