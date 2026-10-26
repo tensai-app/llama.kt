@@ -165,6 +165,45 @@ data class GgufMetadata(
     val kvShapeVersion: Long = 0,
 )
 
+/**
+ * llama.cpp's own timing of the last [LlamaEngine.completion] or [LlamaEngine.prefill]
+ * (`llama_perf_context`), the figures llama-bench reports: [promptTokens] decoded as the prompt
+ * (tokens served from the KV cache are not counted) in [promptMs], then [evalTokens] single-token
+ * decodes in [evalMs]. The first sampled token comes off the prompt's logits, so [evalTokens] is
+ * one less than the tokens sampled.
+ */
+data class PerfTimings(
+    val promptTokens: Int,
+    val promptMs: Double,
+    val evalTokens: Int,
+    val evalMs: Double,
+) {
+    /** Prefill speed, `null` when nothing was timed. */
+    val promptTokPerSec: Double? get() = rate(promptTokens, promptMs)
+
+    /** Token generation speed, `null` when nothing was timed. */
+    val evalTokPerSec: Double? get() = rate(evalTokens, evalMs)
+
+    companion object {
+        /**
+         * From `nativePerf`'s `{ n_p_eval, t_p_eval_ms, n_eval, t_eval_ms }`, `null` for anything else. llama.cpp
+         * counts at least 1 of each; a count with no time is no count, so it reads 0 here.
+         */
+        fun of(values: DoubleArray): PerfTimings? {
+            if (values.size != 4) return null
+            val (pTokens, pMs, eTokens, eMs) = values.toList()
+            return PerfTimings(
+                promptTokens = if (pMs > 0) pTokens.toInt() else 0,
+                promptMs = pMs.coerceAtLeast(0.0),
+                evalTokens = if (eMs > 0) eTokens.toInt() else 0,
+                evalMs = eMs.coerceAtLeast(0.0),
+            )
+        }
+
+        private fun rate(tokens: Int, ms: Double): Double? = if (tokens <= 0 || ms <= 0) null else tokens * 1000.0 / ms
+    }
+}
+
 class LlamaEngine {
 
     private var handle: Long = 0L
@@ -282,6 +321,12 @@ class LlamaEngine {
 
     /** Number of tokens currently occupying the KV cache (sequence 0). */
     fun kvUsed(): Int = nativeKvCacheUsedCells(handle)
+
+    /**
+     * llama.cpp's timing of the last [completion] or [prefill], `null` with no model loaded. Reset when
+     * the next one starts: read it right after the call, from the thread that made it.
+     */
+    fun lastPerf(): PerfTimings? = PerfTimings.of(nativePerf(handle))
 
     /**
      * Interrupt an in-progress [completion] or [prefill]. Safe to call from any thread.
@@ -488,6 +533,7 @@ class LlamaEngine {
     private external fun nativeChatResult(h: Long): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int
+    private external fun nativePerf(h: Long): DoubleArray
     private external fun nativeInterrupt(h: Long)
     private external fun nativeResetInterrupt(h: Long)
     private external fun nativeSaveSession(h: Long, path: String): Int

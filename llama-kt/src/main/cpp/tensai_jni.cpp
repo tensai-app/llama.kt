@@ -2200,6 +2200,34 @@ Java_com_tensai_llamakt_LlamaEngine_nativeTokenize(
 }
 
 // ---------------------------------------------------------------------------
+// nativePerf
+// ---------------------------------------------------------------------------
+// llama.cpp's own timing of the last completion or prefill, what log_perf()
+// prints: { n_p_eval, t_p_eval_ms, n_eval, t_eval_ms }. Reset when the next
+// one begins, so read it right after the call. llama.cpp reports the counts as
+// at least 1; a time of 0 means nothing was measured. Empty without a context.
+
+extern "C" JNIEXPORT jdoubleArray JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativePerf(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h)
+{
+    return jni_guard("nativePerf",
+                     [&] {
+                         auto* rnctx = h == 0L ? nullptr : to_ctx(h);
+                         if (rnctx == nullptr || rnctx->ctx == nullptr) return env->NewDoubleArray(0);
+                         const llama_perf_context_data d = llama_perf_context(rnctx->ctx);
+                         const jdouble values[4] = { static_cast<jdouble>(d.n_p_eval), d.t_p_eval_ms,
+                                                     static_cast<jdouble>(d.n_eval), d.t_eval_ms };
+                         jdoubleArray arr = env->NewDoubleArray(4);
+                         if (arr != nullptr) env->SetDoubleArrayRegion(arr, 0, 4, values);
+                         return arr;
+                     },
+                     [&] { return env->NewDoubleArray(0); });
+}
+
+// ---------------------------------------------------------------------------
 // nativeKvCacheUsedCells
 // ---------------------------------------------------------------------------
 // llama.cpp b9769 does not expose llama_kv_self_used_cells() in the public
