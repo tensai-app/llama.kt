@@ -1,8 +1,30 @@
-# llama.kt
+<p align="center">
+  <img src="https://raw.githubusercontent.com/tensai-app/.github/main/profile/tensai-mark.png" width="80" alt="tensai">
+</p>
 
-[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/hokanosekai/badge.svg)](https://hub.xerj.org/contributors/hokanosekai)
+<h1 align="center">llama.kt</h1>
 
-Kotlin/Android JNI binding for [llama.cpp](https://github.com/ggml-org/llama.cpp). Loads any GGUF model and runs inference on-device — no server, no cloud. The native C++ engine is extracted from [llama.rn](https://github.com/mybigday/llama.rn) (React Native binding), stripped of the RN layer and re-exposed through a plain Kotlin API.
+<p align="center">
+  <a href="https://github.com/tensai-app/llama.kt/actions/workflows/ci.yml"><img src="https://github.com/tensai-app/llama.kt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/tensai-app/llama.kt?label=license" alt="License"></a>
+  <a href="https://github.com/ggml-org/llama.cpp/releases/tag/b9982"><img src="https://img.shields.io/badge/llama.cpp-b9982-7c5cff" alt="llama.cpp b9982"></a>
+  <img src="https://img.shields.io/badge/android-10%2B-3ddc84" alt="Android 10+">
+  <img src="https://img.shields.io/badge/abi-arm64--v8a-555" alt="arm64-v8a">
+  <a href="https://hub.xerj.org/contributors/hokanosekai"><img src="https://hub.xerj.org/contributors/hokanosekai/badge.svg" alt="XERJ Corpus Hub contributor"></a>
+</p>
+
+<p align="center"><b>Kotlin/Android JNI binding for llama.cpp.</b><br>Load any GGUF model and run inference on the phone. No server, no cloud.</p>
+
+<p align="center">
+  <a href="https://tensai.page/llama-kt/">Overview</a> |
+  <a href="https://github.com/tensai-app/tensai">tensai app</a> |
+  <a href="https://tensai.page">tensai.page</a> |
+  <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>
+</p>
+
+---
+
+Kotlin/Android JNI binding for [llama.cpp](https://github.com/ggml-org/llama.cpp). Loads any GGUF model and runs inference on-device, with no server and no cloud. The native C++ engine is extracted from [llama.rn](https://github.com/mybigday/llama.rn) (React Native binding), stripped of the RN layer and re-exposed through a plain Kotlin API.
 
 Built as the inference layer for [tensai](https://github.com/tensai-app/tensai) (open-source Android app, [tensai.page](https://tensai.page)), but usable standalone. Overview, measurements and patch status: [tensai.page/llama-kt](https://tensai.page/llama-kt/).
 
