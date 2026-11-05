@@ -12,7 +12,7 @@ android {
 }
 kotlin { jvmToolchain(21) }
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     // JVM unit tests of the JSON layer (ToolJson). android.jar's org.json is a stub there.
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
