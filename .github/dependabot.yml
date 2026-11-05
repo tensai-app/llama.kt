@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Root build covers :llama-kt and :example. llama.cpp is bumped by hand
+  # (patch rebases), so no gitsubmodule entry.
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build(deps)
+    groups:
+      gradle-minor-patch:
+        update-types: [minor, patch]
