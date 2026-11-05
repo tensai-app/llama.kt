@@ -43,7 +43,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.5")
 
     // Compose BOM
-    val composeBom = platform("androidx.compose:compose-bom:2024.09.02")
+    val composeBom = platform("androidx.compose:compose-bom:2026.09.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
