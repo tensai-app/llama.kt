@@ -1,5 +1,17 @@
 version: 2
 updates:
+  # Actions are pinned by commit SHA; this keeps the pins and their version
+  # comments moving.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      actions:
+        patterns: ["*"]
+
   # Root build covers :llama-kt and :example. llama.cpp is bumped by hand
   # (patch rebases), so no gitsubmodule entry.
   - package-ecosystem: gradle

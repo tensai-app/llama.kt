@@ -1,0 +1,158 @@
+name: Native
+
+# What ci.yml cannot tell: that CMakeLists.txt, the vendored cpp/ sources, the
+# generated Vulkan shaders and libOpenCL.so build and link together. A fresh
+# clone cannot do it without regenerating the shaders (134 MB) and
+# libOpenCL.so, both gitignored. Same steps as the tensai app's native-prereqs
+# action, with paths from this repo's root.
+#
+# No pull_request: a PR (Dependabot mostly) does not pay for this build. It
+# runs on main after the merge, weekly to catch runner image drift, and by
+# hand (workflow_dispatch on a PR branch that touches native code).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'llama-kt/src/main/cpp/**'
+      - '**/CMakeLists.txt'
+      - 'third_party/**'
+      - '.gitmodules'
+      - 'scripts/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - 'gradle.properties'
+      - 'llama-kt/build.gradle.kts'
+      - 'example/build.gradle.kts'
+      - 'gradle/**'
+      - '.github/workflows/native.yml'
+  schedule:
+    - cron: '43 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-build:
+    name: Native build (assembleDebug)
+    # Pinned: ubuntu-latest moves to Ubuntu 26 on 2026-10-19 (runner-images#14748).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OpenCL-Headers is an include of CMakeLists.txt, OpenCL-ICD-Loader builds
+      # the libOpenCL.so llamakt links against. 2 MB together, always needed.
+      # llama.cpp (155 MB) only feeds the shader generation: fetched on a cache
+      # miss only, below.
+      - name: Init OpenCL submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/OpenCL-Headers third_party/OpenCL-ICD-Loader
+
+      # ndkVersion is read from llama-kt/build.gradle.kts, not copied here.
+      # glslc comes from the NDK so its version is pinned by the same thing.
+      - name: Resolve NDK and glslc
+        id: toolchain
+        run: |
+          set -euo pipefail
+          ndk=$(sed -n 's/^ *ndkVersion *= *"\(.*\)"/\1/p' llama-kt/build.gradle.kts)
+          [ -n "$ndk" ] || { echo "ndkVersion not found"; exit 1; }
+          echo "NDK $ndk"
+
+          if [ ! -d "$ANDROID_HOME/ndk/$ndk" ]; then
+            echo "not in the runner image, installing"
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk"
+          fi
+
+          glslc="$ANDROID_HOME/ndk/$ndk/shader-tools/linux-x86_64/glslc"
+          [ -x "$glslc" ] || { echo "glslc missing from the NDK: $glslc"; exit 1; }
+          "$glslc" --version
+
+          echo "glslc=$glslc" >> "$GITHUB_OUTPUT"
+          # The glslc version is the only input besides llama.cpp that changes
+          # the SPIR-V output, so it is part of the cache key.
+          echo "glslc_id=$("$glslc" --version | head -1 | tr -c '[:alnum:].' '-')" \
+            >> "$GITHUB_OUTPUT"
+
+      # Read from the index, without checking the 155 MB out: decides the
+      # cache before paying for the submodule.
+      - name: Resolve pinned llama.cpp revision
+        id: llamacpp
+        run: |
+          set -euo pipefail
+          sha=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
+          [ -n "$sha" ] || { echo "llama.cpp gitlink not found"; exit 1; }
+          echo "llama.cpp $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Separate restore and save: only a set checked complete is saved.
+      - name: Restore generated Vulkan shaders
+        id: shader-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            llama-kt/src/main/cpp/ggml-vulkan/shaders
+            llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan-shaders.hpp
+          key: vk-shaders-${{ steps.llamacpp.outputs.sha }}-${{ steps.toolchain.outputs.glslc_id }}
+
+      - name: Init llama.cpp submodule
+        if: steps.shader-cache.outputs.cache-hit != 'true'
+        run: git submodule update --init --depth 1 third_party/llama.cpp
+
+      - name: Generate Vulkan shaders
+        if: steps.shader-cache.outputs.cache-hit != 'true'
+        run: scripts/gen-vulkan-shaders.sh "${{ steps.toolchain.outputs.glslc }}"
+
+      # On a hit too: a truncated cache shows here, not in a link error later.
+      - name: Check shader set is complete
+        run: |
+          set -euo pipefail
+          OUT=llama-kt/src/main/cpp/ggml-vulkan
+          test -s "$OUT/ggml-vulkan-shaders.hpp"
+          n=$(find "$OUT/shaders" -name '*.comp.cpp' | wc -l)
+          echo "$n .comp.cpp files"
+          [ "$n" -eq 132 ] || { echo "expected 132"; exit 1; }
+
+      - name: Save generated Vulkan shaders
+        if: steps.shader-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            llama-kt/src/main/cpp/ggml-vulkan/shaders
+            llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan-shaders.hpp
+          key: ${{ steps.shader-cache.outputs.cache-primary-key }}
+
+      - name: Build libOpenCL.so
+        run: scripts/build-opencl.sh
+
+      # Host-side tests of llama-free headers and of the vendored chat layer:
+      # a C++ compiler, no model, no backend, no llama.cpp checkout.
+      - name: KV reuse planner test
+        run: scripts/test-kv-reuse.sh
+
+      - name: Vulkan matmul split test
+        run: scripts/test-vk-split.sh
+
+      - name: Completion result test
+        run: scripts/test-completion-result.sh
+
+      - name: Tool-call grammar test
+        run: scripts/test-tool-grammar.sh
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+
+      # The example APK reuses the library's native build: packaging only.
+      - name: Assemble debug
+        run: ./gradlew --no-daemon :llama-kt:assembleDebug :example:assembleDebug
