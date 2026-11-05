@@ -1,5 +1,7 @@
 # llama.kt
 
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/hokanosekai/badge.svg)](https://hub.xerj.org/contributors/hokanosekai)
+
 Kotlin/Android JNI binding for [llama.cpp](https://github.com/ggml-org/llama.cpp). Loads any GGUF model and runs inference on-device — no server, no cloud. The native C++ engine is extracted from [llama.rn](https://github.com/mybigday/llama.rn) (React Native binding), stripped of the RN layer and re-exposed through a plain Kotlin API.
 
 Built as the inference layer for [tensai](https://github.com/tensai-app/tensai) (open-source Android app, [tensai.page](https://tensai.page)), but usable standalone. Overview, measurements and patch status: [tensai.page/llama-kt](https://tensai.page/llama-kt/).
