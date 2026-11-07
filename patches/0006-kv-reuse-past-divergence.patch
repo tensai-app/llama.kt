@@ -1,17 +1,16 @@
 diff --git a/llama-kt/src/main/cpp/rn-completion.cpp b/llama-kt/src/main/cpp/rn-completion.cpp
-index 72a8f33..64e6fe9 100644
 --- a/llama-kt/src/main/cpp/rn-completion.cpp
 +++ b/llama-kt/src/main/cpp/rn-completion.cpp
-@@ -3,6 +3,8 @@
- #include "rn-tts.h"
+@@ -4,6 +4,8 @@
  #include "rn-mtmd.hpp"
  #include "rn-common.hpp"
+ #include "llama-ext.h"  // llama_get_ctx_other (mem-shared MTP draft detection)
 +#include "tensai_kv_reuse.h"
 +#include "llama-context.h"  // llama_context::memory_update(), no public entry point
  
  #include <algorithm>
- #include <cstring>
-@@ -16,6 +18,27 @@
+ #include <cmath>
+@@ -18,6 +20,27 @@
  
  namespace rnllama {
  
@@ -39,9 +38,9 @@ index 72a8f33..64e6fe9 100644
  // Constructor
  llama_rn_context_completion::llama_rn_context_completion(llama_rn_context* parent)
      : parent_ctx(parent) {
-@@ -175,6 +198,65 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
-             }
+@@ -508,6 +531,65 @@
          }
+         n_past = (llama_pos) n_common;
  
 +        // KV reuse past a divergence (TEN-196). The prefix stops where the
 +        // previous answer's reasoning block was dropped by the chat template,

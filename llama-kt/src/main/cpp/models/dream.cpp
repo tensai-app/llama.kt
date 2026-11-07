@@ -133,6 +133,4 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    lm_ggml_build_forward_expand(gf, cur);
 }

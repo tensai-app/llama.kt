@@ -10,30 +10,43 @@
 
 class llama_dsv4_comp_state {
 public:
+    using stream_copy_info = llama_kv_cache::stream_copy_info;
+
+    stream_copy_info sc_info;
+
     llama_dsv4_comp_state(
             const llama_model & model,
-            bool            offload,
-            bool            unified,
-            uint32_t        n_seq_max,
-            uint32_t        ratio,
-            uint32_t        state_size,
-            uint32_t        n_embd_state,
-            const char    * name,
+                         bool   no_alloc,
+                         bool   offload,
+                         bool   unified,
+                     uint32_t   n_seq_max,
+                     uint32_t   ratio,
+                     uint32_t   state_size,
+                     uint32_t   n_embd_state,
+                     uint32_t   n_rs_seq,
+                   const char * name,
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void apply_copies(const stream_copy_info & sc_info) const;
 
-    uint32_t get_ratio()    const;
+    uint32_t get_ratio()      const;
+    bool     is_overlap()     const; // V4 CSA: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
-    uint32_t get_n_stream() const;
+    uint32_t get_n_stream()   const;
+    uint32_t get_n_rs_seq()   const;
+    uint32_t get_n_rows()     const;
 
     std::map<lm_ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, const std::vector<uint32_t> & rs_idx) const;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
-    lm_ggml_tensor * get_kv   (lm_ggml_context * ctx, int32_t il) const;
-    lm_ggml_tensor * get_score(lm_ggml_context * ctx, int32_t il) const;
+    lm_ggml_tensor * get_kv       (lm_ggml_context * ctx, int32_t il) const;
+    lm_ggml_tensor * get_score    (lm_ggml_context * ctx, int32_t il) const;
+    lm_ggml_tensor * get_kv_all   (lm_ggml_context * ctx, int32_t il) const;
+    lm_ggml_tensor * get_score_all(lm_ggml_context * ctx, int32_t il) const;
 
     lm_ggml_tensor * cpy_kv   (lm_ggml_context * ctx, lm_ggml_tensor * cur, lm_ggml_tensor * idxs, int32_t il) const;
     lm_ggml_tensor * cpy_score(lm_ggml_context * ctx, lm_ggml_tensor * cur, lm_ggml_tensor * idxs, int32_t il) const;
@@ -44,14 +57,18 @@ private:
 
         lm_ggml_tensor * kv;
         lm_ggml_tensor * score;
+
+        std::vector<lm_ggml_tensor *> kv_stream;
+        std::vector<lm_ggml_tensor *> score_stream;
     };
 
     const uint32_t ratio;
     const uint32_t state_size;
     const uint32_t n_embd_state;
     const uint32_t n_stream;
+    const uint32_t n_rs_seq;
 
-    std::vector<std::pair<lm_ggml_context_ptr, lm_ggml_backend_buffer_ptr>> ctxs_bufs;
+    llama_memory_bufs ctxs_bufs;
 
     std::vector<layer> layers;
 
@@ -74,6 +91,7 @@ class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
     llama_kv_cache_dsv4(
             const llama_model & model,
+                         bool   no_alloc,
                     lm_ggml_type   type_k,
                     lm_ggml_type   type_v,
                          bool   v_trans,
@@ -83,7 +101,7 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -132,6 +150,13 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // layer whose compressed-KV storage `il` reads, -1 = no compressed KV
+    int32_t get_comp_read_layer(int32_t il) const;
+
+    uint32_t get_n_rs_seq() const;
+    const std::vector<uint32_t> & get_rs_idx() const;
+    void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -139,6 +164,15 @@ private:
     llama_hparams hparams_lid;
 
     const uint32_t n_seq_max;
+    const uint32_t n_rs_seq;
+
+    std::vector<uint32_t> rs_idx;
+
+    // [n_layer] storage layer -> layer whose rows it holds (itself, or the source of a mirror)
+    std::vector<int32_t> comp_il_src;
+
+    // [n_layer] layer -> layer whose compressed-KV storage it reads (itself, its V4.1 kv source or a mirror), -1 = none
+    std::vector<int32_t> comp_read;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -190,6 +224,9 @@ public:
     void set_input_k_idxs(lm_ggml_tensor * dst) const;
     void set_input_kq_mask(lm_ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(lm_ggml_tensor * dst) const;
+
+    // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     size_t i_next = 0;
@@ -245,6 +282,7 @@ private:
 class llama_kv_cache_dsv4_context : public llama_memory_context_i {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
+    using stream_copy_info = llama_kv_cache::stream_copy_info;
 
     struct comp_plan {
         // Per-ubatch recipe for updating compressor state, committing completed
@@ -257,6 +295,17 @@ public:
         // destination row ids for deterministic ring-state updates.
         std::vector<int32_t> state_persist_src_idxs;
         std::vector<int32_t> state_persist_dst_idxs;
+
+        // Device-side rollback restore copies snapshot planes back to the
+        // current compressor-state plane before the graph reads it.
+        std::vector<int32_t> state_restore_src_idxs;
+        std::vector<int32_t> state_restore_dst_idxs;
+
+        // Device-side rollback snapshots copy rows from the graph-local
+        // [persistent_state | current_ubatch_scratch] tensor into rollback
+        // planes after the graph has computed current-token compressor state.
+        std::vector<int32_t> state_snapshot_src_idxs;
+        std::vector<int32_t> state_snapshot_dst_idxs;
 
         // Flattened source row ids used for state-backed commits. Source rows
         // index the graph-local [persistent_state | current_ubatch_scratch]
@@ -291,7 +340,10 @@ public:
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv,
             llama_context * lctx,
-            bool optimize);
+            bool optimize,
+            stream_copy_info sc_info_csa,
+            stream_copy_info sc_info_hca,
+            stream_copy_info sc_info_lid);
 
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv,
@@ -333,6 +385,8 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    int32_t get_comp_read_layer(int32_t il) const;
+
 private:
     size_t i_next = 0;
 
@@ -351,9 +405,13 @@ private:
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_hca;
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lid;
 
-    const llama_dsv4_comp_state * csa_state = nullptr;
-    const llama_dsv4_comp_state * hca_state = nullptr;
-    const llama_dsv4_comp_state * lid_state = nullptr;
+    llama_dsv4_comp_state * csa_state = nullptr;
+    llama_dsv4_comp_state * hca_state = nullptr;
+    llama_dsv4_comp_state * lid_state = nullptr;
+
+    stream_copy_info sc_info_csa;
+    stream_copy_info sc_info_hca;
+    stream_copy_info sc_info_lid;
 
     bool reserve_plans = false;
     mutable comp_plan reserve_plan_csa;
@@ -361,4 +419,6 @@ private:
     mutable comp_plan reserve_plan_lid;
 
     const llama_memory_status status;
+
+    const llama_kv_cache_dsv4 * kv = nullptr;
 };

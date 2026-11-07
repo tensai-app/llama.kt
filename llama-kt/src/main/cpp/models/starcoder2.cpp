@@ -153,6 +153,4 @@ llama_model_starcoder2::graph::graph(const llama_model & model, const llm_graph_
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    lm_ggml_build_forward_expand(gf, cur);
 }

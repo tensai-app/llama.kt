@@ -210,6 +210,8 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
     uint M = ne01;
 
     uint LINE_STRIDE_A    = M / 2;
+    // Keep tail lanes active for subgroup ops, but read a valid weight row.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
    uint BLOCK_STRIDE_A  = NSUBGROUPS * M;
 
     __private uint4     regA;
@@ -220,14 +222,14 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
     __private float2 totalSum = (float2)(0.0f);
 
     for (uint k = groupId; k < (K / QK5_1); k += NSUBGROUPS) {
-        regS = src0_d[gid + k * LINE_STRIDE_A];
-        regM = src0_m[gid + k * LINE_STRIDE_A];
+        regS = src0_d[gid_s + k * LINE_STRIDE_A];
+        regM = src0_m[gid_s + k * LINE_STRIDE_A];
 
         ushort4 qh_raw;
-        qh_raw.s0 = src0_qh[gid + (4*k + 0) * LINE_STRIDE_A];
-        qh_raw.s1 = src0_qh[gid + (4*k + 1) * LINE_STRIDE_A];
-        qh_raw.s2 = src0_qh[gid + (4*k + 2) * LINE_STRIDE_A];
-        qh_raw.s3 = src0_qh[gid + (4*k + 3) * LINE_STRIDE_A];
+        qh_raw.s0 = src0_qh[gid_s + (4*k + 0) * LINE_STRIDE_A];
+        qh_raw.s1 = src0_qh[gid_s + (4*k + 1) * LINE_STRIDE_A];
+        qh_raw.s2 = src0_qh[gid_s + (4*k + 2) * LINE_STRIDE_A];
+        qh_raw.s3 = src0_qh[gid_s + (4*k + 3) * LINE_STRIDE_A];
 
         uchar8 raw = as_uchar8(qh_raw);
         uchar8 qh_bytes = (uchar8)(raw.s0, raw.s2, raw.s4, raw.s6,
@@ -239,10 +241,10 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
             regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
         }
 
-        regA.s0 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA.s1 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA.s2 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA.s3 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        regA.s0 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA.s1 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA.s2 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA.s3 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
 
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_q5_1_sgbroadcast_8_hi(totalSum, as_ushort8(regA), qh_bytes, regS, regM, regB);
@@ -250,10 +252,10 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
         dequantizeBlockAccum_ns_q5_1_sgbroadcast_1_hi(totalSum, as_ushort8(regA), qh_bytes, regS, regM, regB);
 #endif // VECTOR_SUB_GROUP_BROADCAST
 
-        regA.s0 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA.s1 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA.s2 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA.s3 = read_imageui(src0_qs, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        regA.s0 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA.s1 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA.s2 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA.s3 = read_imageui(src0_qs, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_q5_1_sgbroadcast_8_lo(totalSum, as_ushort8(regA), qh_bytes, regS, regM, regB);
 #else
@@ -288,7 +290,12 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
     // 2 outputs per fiber in wave 0
     if (groupId == 0) {
         dst = (global float*)((global char*)dst + offsetd);
-        vstore2(totalSum, 0, &(dst[gid * 2]));
+        // Guard the two output rows. The x-grid is padded to CEIL_DIV(ne01/2,64)*64,
+        // so when ne01 is not a multiple of 128 the tail row-pairs run past row ne01
+        // and would overrun dst into the adjacent tensor. No-op / byte-identical when
+        // ne01 % 128 == 0 (M/2 already a multiple of 64 -> no padding).
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = totalSum.s1;
     }
 
 }

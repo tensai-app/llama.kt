@@ -8,24 +8,28 @@
 extern "C" {
 #endif
 
-    #define LM_GGML_BACKEND_API_VERSION 2
+    #define LM_GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
     //
 
     struct lm_ggml_backend_buffer_type_i {
-        const char *          (*get_name)      (lm_ggml_backend_buffer_type_t buft);
+        const char *          (*get_name)        (lm_ggml_backend_buffer_type_t buft);
         // allocate a buffer of this type
-        lm_ggml_backend_buffer_t (*alloc_buffer)  (lm_ggml_backend_buffer_type_t buft, size_t size);
+        lm_ggml_backend_buffer_t (*alloc_buffer)    (lm_ggml_backend_buffer_type_t buft, size_t size);
+        // (optional) allocate tensors from a list into a buffer of this type (defaults to alloc_buffer + linear allocator)
+        lm_ggml_backend_buffer_t (*alloc_buffer_n)  (lm_ggml_backend_buffer_type_t buft, struct lm_ggml_tensor ** tensors, int n_tensors);
         // tensor alignment
-        size_t                (*get_alignment) (lm_ggml_backend_buffer_type_t buft);
+        size_t                (*get_alignment)   (lm_ggml_backend_buffer_type_t buft);
         // (optional) max buffer size that can be allocated (defaults to SIZE_MAX)
-        size_t                (*get_max_size)  (lm_ggml_backend_buffer_type_t buft);
+        size_t                (*get_max_size)    (lm_ggml_backend_buffer_type_t buft);
         // (optional) data size needed to allocate the tensor, including padding (defaults to lm_ggml_nbytes)
-        size_t                (*get_alloc_size)(lm_ggml_backend_buffer_type_t buft, const struct lm_ggml_tensor * tensor);
+        size_t                (*get_alloc_size)  (lm_ggml_backend_buffer_type_t buft, const struct lm_ggml_tensor * tensor);
+        // (optional) total data size needed to allocate the given tensors, including padding and splitting (defaults to per-tensor get_alloc_size)
+        size_t                (*get_alloc_size_n)(lm_ggml_backend_buffer_type_t buft, struct lm_ggml_tensor ** tensors, int n_tensors);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
-        bool                  (*is_host)       (lm_ggml_backend_buffer_type_t buft);
+        bool                  (*is_host)         (lm_ggml_backend_buffer_type_t buft);
     };
 
     struct lm_ggml_backend_buffer_type {
@@ -33,6 +37,11 @@ extern "C" {
         lm_ggml_backend_dev_t device;
         void * context;
     };
+
+    // [TAG_ALLOC_SIZE_EXPAND]
+    // returns true for ops that may require additional memory for fleeting data on some backends,
+    // i.e. the backend buffer type's get_alloc_size may return more than lm_ggml_nbytes for the output tensor
+    LM_GGML_API bool lm_ggml_op_alloc_size_may_expand(enum lm_ggml_op op);
 
     //
     // Backend buffer
@@ -83,6 +92,7 @@ extern "C" {
     LM_GGML_API lm_ggml_backend_buffer_t lm_ggml_backend_multi_buffer_alloc_buffer(lm_ggml_backend_buffer_t * buffers, size_t n_buffers);
     LM_GGML_API bool                  lm_ggml_backend_buffer_is_multi_buffer(lm_ggml_backend_buffer_t buffer);
     LM_GGML_API void                  lm_ggml_backend_multi_buffer_set_usage(lm_ggml_backend_buffer_t buffer, enum lm_ggml_backend_buffer_usage usage);
+    LM_GGML_API void                  lm_ggml_backend_meta_buffer_set_usage (lm_ggml_backend_buffer_t buffer, enum lm_ggml_backend_buffer_usage usage);
 
     //
     // Backend (meta)
@@ -95,12 +105,19 @@ extern "C" {
     LM_GGML_API size_t         lm_ggml_backend_meta_n_backends    (lm_ggml_backend_t meta_backend);
     LM_GGML_API lm_ggml_backend_t lm_ggml_backend_meta_simple_backend(lm_ggml_backend_t meta_backend, size_t index);
 
-    // temporary workaround to statically allocate tensors from a context in a deduplicated way:
-    LM_GGML_API struct lm_ggml_backend_buffer * lm_ggml_backend_meta_alloc_ctx_tensors_from_buft(struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft);
-
     //
     // Backend (stream)
     //
+
+    // passed to graph_optimize so the backend can add allocation dependencies:
+    // if the backend executes parts of the graph out of order (e.g. on concurrent streams),
+    // it must keep the affected tensors allocated until a node where execution is known to have joined
+    struct lm_ggml_backend_graph_optimize_params {
+        // keep `tensor` allocated at least until `until` (a node of the same graph) has been computed
+        // can be called multiple times for the same tensor: the longest lifetime applies
+        void (*add_alloc_dep)(void * user_data, struct lm_ggml_tensor * tensor, struct lm_ggml_tensor * until);
+        void * user_data;
+    };
 
     struct lm_ggml_backend_i {
         const char * (*get_name)(lm_ggml_backend_t backend);
@@ -136,7 +153,7 @@ extern "C" {
         void (*event_wait)  (lm_ggml_backend_t backend, lm_ggml_backend_event_t event);
 
         // (optional) sort/optimize the nodes in the graph
-        void                      (*graph_optimize)    (lm_ggml_backend_t backend, struct lm_ggml_cgraph * cgraph);
+        void                      (*graph_optimize)    (lm_ggml_backend_t backend, struct lm_ggml_cgraph * cgraph, struct lm_ggml_backend_graph_optimize_params * params);
     };
 
     struct lm_ggml_backend {

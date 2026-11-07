@@ -433,10 +433,21 @@ extern "C" {
         LM_GGML_TYPE_COUNT   = 43,
     };
 
-    // precision
+    // [TAG_LM_GGML_PREC]
+    // this enum is used to declare the allowed numerical precision/data-types types that can be used during the compute of an op
+    // the declared types can be:
+    //  - result accumulation type
+    //  - source tensor data representation type
+    //  - etc.
+    // the precision parameters are stored as lm_ggml_tensor.op_params to the respective ops
     enum lm_ggml_prec {
-        LM_GGML_PREC_DEFAULT =  0, // stored as lm_ggml_tensor.op_params, 0 by default
-        LM_GGML_PREC_F32     = 10,
+        LM_GGML_PREC_UNDEFINED = 0,
+        LM_GGML_PREC_DEFAULT   = 0,  // note: deprecated, use LM_GGML_PREC_UNDEFINED
+        LM_GGML_PREC_F32       = 10,
+        LM_GGML_PREC_BF16      = 15,
+        LM_GGML_PREC_F16       = 20,
+        LM_GGML_PREC_Q8        = 30,
+        LM_GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -571,6 +582,10 @@ extern "C" {
         LM_GGML_OP_SOLVE_TRI,
         LM_GGML_OP_GATED_DELTA_NET,
         LM_GGML_OP_LIGHTNING_INDEXER,
+        LM_GGML_OP_DSV4_HC_COMB,
+        LM_GGML_OP_DSV4_HC_PRE,
+        LM_GGML_OP_DSV4_HC_POST,
+        LM_GGML_OP_TOP_K_MASK,
 
         LM_GGML_OP_UNARY,
 
@@ -624,6 +639,7 @@ extern "C" {
         LM_GGML_GLU_OP_SWIGLU_OAI,
         LM_GGML_GLU_OP_GEGLU_ERF,
         LM_GGML_GLU_OP_GEGLU_QUICK,
+        LM_GGML_GLU_OP_SWIGLU_CLAMP,
 
         LM_GGML_GLU_OP_COUNT,
     };
@@ -780,6 +796,10 @@ extern "C" {
     LM_GGML_API bool lm_ggml_is_contiguous_1(const struct lm_ggml_tensor * tensor); // contiguous for dims >= 1
     LM_GGML_API bool lm_ggml_is_contiguous_2(const struct lm_ggml_tensor * tensor); // contiguous for dims >= 2
 
+    LM_GGML_API bool lm_ggml_is_contiguous_to_1(const struct lm_ggml_tensor * tensor); // contiguous for dims < 1
+    LM_GGML_API bool lm_ggml_is_contiguous_to_2(const struct lm_ggml_tensor * tensor); // contiguous for dims < 2
+    LM_GGML_API bool lm_ggml_is_contiguous_to_3(const struct lm_ggml_tensor * tensor); // contiguous for dims < 3
+
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     LM_GGML_API bool lm_ggml_is_contiguously_allocated(const struct lm_ggml_tensor * tensor);
 
@@ -906,6 +926,7 @@ extern "C" {
             enum   lm_ggml_type      type);
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
+    // an id of -1 adds nothing: dst[i0, i1, i2] = a[i0, i1, i2]
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_add_id(
             struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * a,
@@ -1360,6 +1381,12 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_swiglu_clamp(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * a,
+            struct lm_ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_norm(
             struct lm_ggml_context * ctx,
@@ -1415,6 +1442,52 @@ extern "C" {
             struct lm_ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_LM_GGML_PREC]
+    // set the minimum required accumulator type for the implementation to use during the compute
+    // for example:
+    //  - LM_GGML_PREC_F32  - requires accumulation of the results in F32
+    //  - LM_GGML_PREC_BF16 - can accumulate the results in BF16, F32
+    //  - LM_GGML_PREC_F16  - can accumulate the results in F16, F32
+    //  - LM_GGML_PREC_Q8   - not allowed
+    //  - LM_GGML_PREC_Q4   - not allowed
+    //
+    // return false on faliure
+    LM_GGML_API bool lm_ggml_prec_set_acc(
+            struct lm_ggml_tensor * a,
+            enum lm_ggml_prec       prec);
+
+    // [TAG_LM_GGML_PREC]
+    // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // ranks in decreasing order:
+    //  - LM_GGML_PREC_F32  - LM_GGML_TYPE_F32
+    //  - LM_GGML_PREC_BF16 - LM_GGML_TYPE_BF16
+    //  - LM_GGML_PREC_F16  - LM_GGML_TYPE_F16,
+    //  - LM_GGML_PREC_Q8   - LM_GGML_TYPE_Q8_0, LM_GGML_TYPE_Q8_1, LM_GGML_TYPE_Q8_K, etc.
+    //  - LM_GGML_PREC_Q4   - LM_GGML_TYPE_Q4_0, LM_GGML_TYPE_Q4_1, LM_GGML_TYPE_Q4_K, LM_GGML_TYPE_NVFP4, LM_GGML_TYPE_MXFP4, etc.
+    //
+    // for example:
+    //   - lm_ggml_prec_set_src(a, LM_GGML_PREC_Q8, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to LM_GGML_TYPE_Q8_0
+    //     - cannot quantize it down to LM_GGML_TYPE_Q4_0 or LM_GGML_TYPE_NVFP4
+    //   - lm_ggml_prec_set_src(a, LM_GGML_PREC_Q4, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as LM_GGML_TYPE_Q4_K, LM_GGML_TYPE_NVFP4 etc.
+    //
+    // return false on faliure
+    LM_GGML_API bool lm_ggml_prec_set_src(
+            struct lm_ggml_tensor * a,
+            enum lm_ggml_prec       prec,
+            int                  idx);
+
+    // [TAG_LM_GGML_PREC]
+    // get the accumulator / src[idx] precision set by the functions above
+    // return LM_GGML_PREC_UNDEFINED when the op does not carry the requested precision
+    LM_GGML_API enum lm_ggml_prec lm_ggml_prec_get_acc(
+            const struct lm_ggml_tensor * a);
+
+    LM_GGML_API enum lm_ggml_prec lm_ggml_prec_get_src(
+            const struct lm_ggml_tensor * a,
+            int                        idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1425,9 +1498,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to LM_GGML_PREC_F32 for higher precision (useful for phi-2)
-    LM_GGML_API void lm_ggml_mul_mat_set_prec(
+    LM_GGML_DEPRECATED(LM_GGML_API void lm_ggml_mul_mat_set_prec(
             struct lm_ggml_tensor * a,
-            enum lm_ggml_prec       prec);
+            enum lm_ggml_prec       prec),
+        "use lm_ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     LM_GGML_API void lm_ggml_mul_mat_set_hint(
@@ -1435,6 +1509,12 @@ extern "C" {
             enum lm_ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // an id of -1 skips the slot and zeroes the matching row of the result
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_mul_mat_id(
             struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * as,
@@ -1717,6 +1797,19 @@ extern "C" {
             struct lm_ggml_tensor  * a,
             int                   n_past);
 
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp_inplace(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_soft_max(
             struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * a);
@@ -1974,14 +2067,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-
-    // clamp
-    // in-place, returns view(a)
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp(
-            struct lm_ggml_context * ctx,
+    // set the offset dims for RoPE
+    // a must be LM_GGML_OP_ROPE or LM_GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_rope_set_offset(
             struct lm_ggml_tensor  * a,
-            float                 min,
-            float                 max);
+            int                   n_offs);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2419,12 +2512,19 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    LM_GGML_API void lm_ggml_flash_attn_ext_set_prec(
+    LM_GGML_DEPRECATED(LM_GGML_API void lm_ggml_flash_attn_ext_set_prec(
             struct lm_ggml_tensor * a,
-            enum lm_ggml_prec       prec);
+            enum lm_ggml_prec       prec),
+        "use lm_ggml_prec_set_acc() instead");
 
     LM_GGML_API enum lm_ggml_prec lm_ggml_flash_attn_ext_get_prec(
             const struct lm_ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    LM_GGML_API void lm_ggml_flash_attn_ext_set_n_kv_max(
+            struct lm_ggml_tensor * a,
+            int32_t              n_kv_max);
 
     LM_GGML_API void lm_ggml_flash_attn_ext_add_sinks(
             struct lm_ggml_tensor * a,
@@ -2452,7 +2552,8 @@ extern "C" {
             struct lm_ggml_tensor  * A,
             struct lm_ggml_tensor  * B,
             struct lm_ggml_tensor  * C,
-            struct lm_ggml_tensor  * ids);
+            struct lm_ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2566,6 +2667,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_gated_delta_net(
             struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * q,
@@ -2593,6 +2695,75 @@ extern "C" {
         struct lm_ggml_tensor  * k,
         struct lm_ggml_tensor  * weights,
         struct lm_ggml_tensor  * mask);
+
+    // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
+    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
+    // using a richer representation through streams.
+    //
+    // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //          -> [dst_hc, src_hc, n_tokens]
+    // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
+    //                         + base[2*hc + dst + hc*src]
+    // Softmax over dst, add eps, normalize over src, then repeat normalization
+    // over dst followed by src for iterations 1 through n_iter - 1.
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_comb(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * mixes,
+            struct lm_ggml_tensor  * scale,
+            struct lm_ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
+    //
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_pre(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * x,
+            struct lm_ggml_tensor  * weights);
+
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_pre_gated(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * x,
+            struct lm_ggml_tensor  * gate,
+            float                 scale);
+
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
+    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    //          -> [n_embd, hc, n_tokens]
+    //   result[i, dst, t] = x[i, t]*post[dst, t]
+    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
+    //
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_post(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * x,
+            struct lm_ggml_tensor  * residual,
+            struct lm_ggml_tensor  * post,
+            struct lm_ggml_tensor  * comb);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_top_k_mask(
+            struct lm_ggml_context * ctx,
+            struct lm_ggml_tensor  * mask,
+            struct lm_ggml_tensor  * top_k,
+            struct lm_ggml_tensor  * score,
+            struct lm_ggml_tensor  * blocks,
+            struct lm_ggml_tensor  * extra);
 
     // custom operators
 
@@ -2739,6 +2910,12 @@ extern "C" {
             int                   idx);
 
     LM_GGML_API void lm_ggml_build_forward_expand(
+            struct lm_ggml_cgraph * cgraph,
+            struct lm_ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    LM_GGML_API void lm_ggml_build_forward_order(
             struct lm_ggml_cgraph * cgraph,
             struct lm_ggml_tensor * tensor);
 

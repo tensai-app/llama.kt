@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/tensai-app/llama.kt/actions/workflows/ci.yml"><img src="https://github.com/tensai-app/llama.kt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/tensai-app/llama.kt?label=license" alt="License"></a>
-  <a href="https://github.com/ggml-org/llama.cpp/releases/tag/b9982"><img src="https://img.shields.io/badge/llama.cpp-b9982-7c5cff" alt="llama.cpp b9982"></a>
+  <a href="https://github.com/ggml-org/llama.cpp/releases/tag/b11960"><img src="https://img.shields.io/badge/llama.cpp-b11960-7c5cff" alt="llama.cpp b11960"></a>
   <img src="https://img.shields.io/badge/android-10%2B-3ddc84" alt="Android 10+">
   <img src="https://img.shields.io/badge/abi-arm64--v8a-555" alt="arm64-v8a">
   <a href="https://hub.xerj.org/contributors/hokanosekai"><img src="https://hub.xerj.org/contributors/hokanosekai/badge.svg" alt="XERJ Corpus Hub contributor"></a>
@@ -232,7 +232,7 @@ Autorun extras: `gpu` (bool), `ngl` (int, explicit layer count), `prompt` (strin
 
 ## Building from source
 
-`scripts/bootstrap.sh` copies llama.cpp sources from the pinned submodule into `llama-kt/src/main/cpp/` and rewrites symbols (`ggml_` → `lm_ggml_`) to avoid collisions. It also pulls the `rn-*` glue and the inherited patches from llama.rn, cloned on demand at the revision in [`scripts/llama.rn.rev`](scripts/llama.rn.rev) (default `/tmp/llama.rn-ref`, override with `LLAMA_RN_REF_DIR`). `scripts/build-opencl.sh` builds the `libOpenCL.so` ICD stub from the Khronos submodules. Both run against the `third_party/` submodules — init them first.
+`scripts/bootstrap.sh` copies llama.cpp sources from the pinned submodule into `llama-kt/src/main/cpp/` and rewrites symbols (`ggml_` → `lm_ggml_`) to avoid collisions. It also pulls the `rn-*` glue and the inherited patches from llama.rn, cloned on demand at the revision in [`scripts/llama.rn.rev`](scripts/llama.rn.rev) (default `/tmp/llama.rn-ref`, override with `LLAMA_RN_REF_DIR`): llama.rn's `scripts/patches/llama.cpp/` go on an export of the submodule before anything is copied. `rn-tts.cpp` is not vendored (since llama.rn 0.13 it needs codec.cpp, for text-to-speech llama.kt does not expose); `tensai_tts_stub.cpp` stands in for it. `scripts/build-opencl.sh` builds the `libOpenCL.so` ICD stub from the Khronos submodules. Both run against the `third_party/` submodules: init them first.
 
 ```bash
 git submodule update --init --recursive
@@ -245,12 +245,11 @@ bash scripts/build-opencl.sh
 
 The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mtmd.hpp` + the `ggml-opencl/` backend. We extract files, not fork the repo (avoids merge conflicts from the JS side). To pull upstream changes: bump the `third_party/llama.cpp` submodule deliberately (breaking API changes are frequent), re-run `bootstrap.sh`, port relevant `rn-*` changes from a fresh llama.rn checkout, rebuild. The `cpp/jsi/` React Native adapter is intentionally dropped.
 
-**Both upstreams are pinned.** llama.cpp by its submodule sha, llama.rn by `scripts/llama.rn.rev` — a `--depth 1` clone of a moving default branch used to decide what landed in `cpp/`, so two runs a fortnight apart produced different sources with nothing in the repo to say which. `bootstrap.sh` now checks out that sha and aborts if the checkout doesn't match or has been edited in place. The two pins are coupled: the inherited `scripts/patches/` are written against llama.rn's own llama.cpp submodule, so bumping one without the other makes those patches fail — which is now fatal, not a warning. Bump them together.
+**Both upstreams are pinned.** llama.cpp by its submodule sha, llama.rn by `scripts/llama.rn.rev`. It used to be a `--depth 1` clone of a moving default branch used to decide what landed in `cpp/`, so two runs a fortnight apart produced different sources with nothing in the repo to say which. `bootstrap.sh` now checks out that sha and aborts if the checkout doesn't match or has been edited in place. The two pins are coupled: the inherited patches are written against the llama.cpp commit in llama.rn's `vendor/VERSIONS`, and `bootstrap.sh` refuses a submodule at any other commit. Bump them together.
 
-**Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
+**Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap: after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches (0004 and 0013 were dropped at b11960, llama.rn 0.13 carries both fixes):
 - `0002-abort-callback-mid-graph-cancel.patch`: ggml abort callback checked per graph node, so cancelling a long prefill does not wait for the whole batch (TEN-17). Targets `rn-llama.cpp`, `rn-completion.h`, `rn-completion.cpp`.
 - `0003-vulkan-device-dispatcher-init.patch`: loads device-level Vulkan function pointers after `createDevice` (the Android loader only fills instance-level ones), and turns off `buffer_device_address` when the driver advertises it without exposing `vkGetBufferDeviceAddress` (Mali).
-- `0004-stale-embd-kv-invariant.patch`: `rn-completion.cpp` never trusts KV cells that were not decoded (embd vs KV position check, SWA window guard, embd trimmed on abort) (TEN-114).
 - `0005-load-stage-callback.patch`: `common.{h,cpp}` gain `common_params::load_stage_callback`, fired at WEIGHTS / CONTEXT / WARMUP inside `common_init_from_params`; `tensai_jni.cpp` turns it into `LoadProgressCallback.onStage` (TEN-123).
 - `0006-kv-reuse-past-divergence.patch`: `rn-completion.cpp` keeps the KV cache up to the point where a new prompt diverges from the cached one, instead of dropping it, so a follow-up after a removed reasoning block does not re-prefill the whole history.
 - `0007-vulkan-submit-mflops-env.patch`: `ggml-vulkan.cpp` reads `LM_GGML_VK_SUBMIT_MFLOPS` to pin the work per Vulkan submit (in MFLOP), instead of the stock doubling.
@@ -259,7 +258,6 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - `0010-no-prompt-token-log.patch`: `rn-completion.cpp` no longer logs every prompt token id at INFO. The ids decode back to the prompt with the model's vocabulary, and the line reached logcat in release builds.
 - `0011-sticky-interrupt-decode-failed.patch`: `rn-completion.{h,cpp}`: `is_interrupted` becomes a `std::atomic<bool>` that `rewind()` no longer clears (only `nativeResetInterrupt` does, so a stop landing before the decode starts is not erased), and a `llama_decode()` error sets `decode_failed`, which `nativeCompletion` reports as -1 instead of a finished reply. On the MTP path an abort (`ret == 2`) ends the completion like an interrupt and any other error sets `decode_failed`, instead of throwing.
 - `0012-kv-reuse-shift-failure.patch`: `rn-completion.cpp` checks that the K-shift of a KV reuse (0006) really ran: when it failed (a Stop aborts its graph, or it could not be allocated), the moved cells are dropped and re-prefilled instead of being kept with their new positions and unrotated K.
-- `0013-init-sampling-dangling-sampler.patch`: `rn-completion.cpp`'s `initSampling()` forgets the sampler it frees before building the next one, so a `common_sampler_init()` that throws (a grammar that does not parse, LKT-48) no longer leaves a freed pointer for the retry or the destructor to free again.
 - `0014-no-prompt-text-decode-failure-log.patch`: `rn-completion.cpp`'s "failed to eval" error logs counters (return code, n_eval, n_past, embd size) instead of the remaining prompt as text, which reached logcat in release builds. Same policy as 0010.
 
 ## Roadmap

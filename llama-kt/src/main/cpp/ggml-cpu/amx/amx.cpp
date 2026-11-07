@@ -228,12 +228,14 @@ static bool lm_ggml_amx_init() {
 lm_ggml_backend_buffer_type_t lm_ggml_backend_amx_buffer_type() {
     static struct lm_ggml_backend_buffer_type lm_ggml_backend_buffer_type_amx = {
         /* .iface = */ {
-                        /* .get_name         = */ lm_ggml_backend_amx_buffer_type_get_name,
-                        /* .alloc_buffer     = */ lm_ggml_backend_amx_buffer_type_alloc_buffer,
-                        /* .get_alignment    = */ lm_ggml_backend_amx_buffer_type_get_alignment,
-                        /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
-                        /* .get_alloc_size   = */ lm_ggml_backend_amx_buffer_type_get_alloc_size,
-                        /* .is_host          = */ nullptr,
+                        /* .get_name            = */ lm_ggml_backend_amx_buffer_type_get_name,
+                        /* .alloc_buffer        = */ lm_ggml_backend_amx_buffer_type_alloc_buffer,
+                        /* .alloc_buffer_n      = */ nullptr,
+                        /* .get_alignment       = */ lm_ggml_backend_amx_buffer_type_get_alignment,
+                        /* .get_max_size        = */ nullptr,  // defaults to SIZE_MAX
+                        /* .get_alloc_size      = */ lm_ggml_backend_amx_buffer_type_get_alloc_size,
+                        /* .get_alloc_size_n    = */ NULL,
+                        /* .is_host             = */ nullptr,
                         },
         /* .device  = */ lm_ggml_backend_reg_dev_get(lm_ggml_backend_cpu_reg(), 0),
         /* .context = */ new ggml::cpu::amx::extra_buffer_type(),

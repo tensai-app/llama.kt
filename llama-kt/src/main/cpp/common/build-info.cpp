@@ -3,8 +3,8 @@
 #include <cstdio>
 #include <string>
 
-int LLAMA_BUILD_NUMBER = 9982;
-char const * LLAMA_COMMIT = "99f3dc3";
+int LLAMA_BUILD_NUMBER = 11960;
+char const * LLAMA_COMMIT = "8642541";
 char const * LLAMA_COMPILER = "unknown";
 char const * LLAMA_BUILD_TARGET = "android";
 
@@ -29,7 +29,7 @@ const char * llama_build_info(void) {
     return s.c_str();
 }
 
-void llama_print_build_info(void) {
-    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, llama_build_number(), llama_commit());
-    fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
+void llama_print_build_info(const char * llama_version, FILE * stream) {
+    fprintf(stream, "version: %s (build %d, commit %s)\n", llama_version, llama_build_number(), llama_commit());
+    fprintf(stream, "built with %s for %s\n", llama_compiler(), llama_build_target());
 }

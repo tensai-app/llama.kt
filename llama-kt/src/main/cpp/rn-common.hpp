@@ -25,7 +25,7 @@
 
 namespace rnllama {
 
-inline static std::string backend_devices_info() {
+inline static json backend_devices_info() {
     json devices_array = json::array();
 
     const size_t dev_count = lm_ggml_backend_dev_count();
@@ -67,8 +67,6 @@ inline static std::string backend_devices_info() {
 
         // Device name and description
         device_info["deviceName"] = props.name ? props.name : "Unknown Device";
-        // Human-readable marketing name from the driver (e.g. "Mali-G68 MC4"); "" when none.
-        device_info["deviceDescription"] = props.description ? props.description : "";
 
         // Memory information
         size_t memory_total = props.memory_total;
@@ -77,13 +75,14 @@ inline static std::string backend_devices_info() {
 #ifdef LM_GGML_USE_METAL
         if (std::string(backend_name) == "Metal" || std::string(backend_name) == "metal") {
             // Try to get Metal-specific device properties
-            lm_ggml_metal_device_t metal_dev = lm_ggml_metal_device_get(0);
+            lm_ggml_metal_device_t metal_dev = lm_ggml_metal_device_get(0, 1);
             if (metal_dev) {
                 const lm_ggml_metal_device_props* metal_props = lm_ggml_metal_device_get_props(metal_dev);
                 if (metal_props) {
                     // Add Metal-specific metadata
                     json metadata;
-                    metadata["supportsMTLGPUFamilyApple7"] = metal_props->supports_gpu_family_apple7;
+                    // gpu_family is the highest MTLGPUFamilyAppleN the device supports
+                    metadata["supportsMTLGPUFamilyApple7"] = metal_props->gpu_family >= 7;
                     metadata["hasBFloat16"] = metal_props->has_bfloat;
                     metadata["hasSimdgroupReduction"] = metal_props->has_simdgroup_reduction;
                     metadata["hasSimdgroupMM"] = metal_props->has_simdgroup_mm;
@@ -132,7 +131,7 @@ inline static std::string backend_devices_info() {
         devices_array.push_back(device_info);
     }
 
-    return devices_array.dump();
+    return devices_array;
 }
 
 // Helper function to check if string ends with suffix

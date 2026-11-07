@@ -1,17 +1,17 @@
 # Pinned mybigday/llama.rn revision that produced the vendored rn-* glue in
-# llama-kt/src/main/cpp/ and the inherited patches in scripts/patches/.
+# llama-kt/src/main/cpp/ and whose llama.cpp patches bootstrap.sh applies.
 #
-# v0.12.6 — https://github.com/mybigday/llama.rn/releases/tag/v0.12.6
-# (annotated tag object 84ccc527; this is the commit it points to)
+# v0.13.0-rc.9: https://github.com/mybigday/llama.rn/releases/tag/v0.13.0-rc.9
+# (the commit the tag points to)
 #
-# Coupled with third_party/llama.cpp: llama.rn v0.12.6 pins llama.cpp at
-# 99f3dc32296f825fec94f202da1e9fede1e78cf9, the same commit as our submodule.
-# The inherited patches are written against that llama.cpp, so the two move
-# together (TEN-87). bootstrap.sh copies the rn-* files verbatim (the LM_
-# rewrite explicitly skips rn-*); the targets of patches/0002, 0004, 0006, 0010, 0011, 0012, 0013 and 0014 (rn-*) and 0005 (common.*) are the only
-# ones that differ from this commit's cpp/ tree.
+# Coupled with third_party/llama.cpp: this revision vendors llama.cpp v0.8.0 (b11960),
+# 8642541b255bfb5dc39cd351a178be09013a55d6, the same commit as our submodule; its
+# vendor/VERSIONS says so and bootstrap.sh refuses to run when the two disagree.
+# The rn-* files are copied verbatim, then get the same LM_ rewrite as the rest;
+# scripts/patches/llama.cpp/*.patch go on an export of the submodule before the copy.
+# rn-tts.cpp is left out (it needs codec.cpp, see bootstrap.sh).
 #
 # To bump: pick the new llama.rn revision, put its full sha here, move the
-# llama.cpp submodule to the sha that revision pins, re-run bootstrap.sh, and
-# re-port patches/0002, 0004, 0006, 0010, 0011, 0012, 0013 and 0014 if the rn-completion/rn-llama hunks moved.
-114ad4b4c9915f19ee941755ac0293be9715105c
+# llama.cpp submodule to the LLAMA_CPP_COMMIT in its vendor/VERSIONS, re-run
+# bootstrap.sh, and re-port patches/ where the vendored sources moved.
+27783c86cea93ac534fba303d9be5cf335d2e945

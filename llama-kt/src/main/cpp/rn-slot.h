@@ -38,6 +38,7 @@ enum llama_rn_slot_task_type {
     SLOT_TASK_TYPE_COMPLETION = 0,
     SLOT_TASK_TYPE_EMBEDDING,
     SLOT_TASK_TYPE_RERANK,
+    SLOT_TASK_TYPE_DECISION,
 };
 
 // Slot states
@@ -82,6 +83,10 @@ struct llama_rn_slot {
     std::vector<std::string> media_paths;         // Media paths for deferred processing
     std::string prompt_text;                      // Original prompt text for media processing
     bool media_processed;                         // Flag indicating if media has been processed
+    // First token, sampled right after media ingest while the context logits
+    // still belong to processMedia's final decode - process_batch() overwrites
+    // them with other slots' tokens before sample_and_callback runs
+    llama_token media_pending_token = LLAMA_TOKEN_NULL;
 
     // Completion state (migrated from llama_rn_context_completion)
     std::string prefill_text;
@@ -108,14 +113,14 @@ struct llama_rn_slot {
     // Sampling context (per-slot)
     common_params params_storage;
     common_params* params;
+    bool post_sampling_probs = true;
     common_sampler* ctx_sampling;
 
-    // Speculative decoding context for MTP.
+    // Speculative decoding context (MTP or classic draft-simple).
     common_speculative *spec = nullptr;
     llama_context *spec_ctx = nullptr;
     bool spec_is_shared = false;
-    llama_batch spec_batch = {};
-    bool spec_batch_initialized = false;
+    common_batch spec_batch;
     llama_tokens spec_prompt;
     llama_token spec_id_last = LLAMA_TOKEN_NULL;
     llama_pos spec_n_past = 0;
@@ -157,6 +162,9 @@ struct llama_rn_slot {
     std::vector<float> rerank_scores;
     size_t rerank_current_index;
 
+    // Decision task state, evaluated by the slot manager outside of the shared batch
+    std::shared_ptr<llama_rn_decision_job> decision_job;
+
     // State management (per-slot)
     std::string load_state_path;      // Path to load state from before processing
     std::string save_state_path;      // Path to save state to after completion
@@ -192,6 +200,16 @@ struct llama_rn_slot {
     bool load_state();             // Load state into this slot's sequence
     bool save_state();             // Save state from this slot's sequence
     bool save_prompt_state_checkpoint();  // Save prompt checkpoint
+
+    // Trim this slot's sequence memory to [0, n_keep) so decoding can resume
+    // at position n_keep. Falls back to a full sequence clear when the memory
+    // cannot be rolled back (recurrent/hybrid beyond the rollback ring) or
+    // when SWA pruning already dropped positions the resumed window needs.
+    // tokens_have_media: whether the token list backing [0, n_keep) holds
+    // LLAMA_TOKEN_NULL placeholders - only then may an M-RoPE frontier
+    // legitimately sit below n_keep. Returns the position decoding must
+    // resume from (n_keep, or 0 after a fallback clear).
+    llama_pos reconcile_memory_to(llama_pos n_keep, bool tokens_have_media);
 };
 
 } // namespace rnllama

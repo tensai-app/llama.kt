@@ -143,9 +143,7 @@ lm_ggml_cgraph * clip_graph_granite_speech::build() {
             }
             cb(x, "conv_glu", il);
 
-            x = lm_ggml_pad(ctx0, x, conv_pad, 0, 0, 0);
-            x = lm_ggml_roll(ctx0, x, conv_pad, 0, 0, 0);
-            x = lm_ggml_pad(ctx0, x, conv_pad, 0, 0, 0);
+            x = lm_ggml_pad_ext(ctx0, x, conv_pad, conv_pad, 0, 0, 0, 0, 0, 0);
             x = lm_ggml_ssm_conv(ctx0, x, layer.conv_dw_w);
             cb(x, "conv_dw", il);
 

@@ -38,11 +38,18 @@ struct llama_rn_parallel_status {
     std::vector<llama_rn_request_status> requests;
 };
 
+enum class llama_rn_cancel_result {
+    ACTIVE,
+    QUEUED,
+    NOT_FOUND,
+};
+
 // Queued request structure
 struct llama_rn_queued_request {
     int32_t request_id;
     llama_rn_slot_task_type task_type;
     common_params params;
+    bool post_sampling_probs = true;
     std::vector<llama_token> prompt_tokens;
     std::function<void(const completion_token_output&)> on_token;
     std::function<void(llama_rn_slot*)> on_complete;
@@ -68,6 +75,8 @@ struct llama_rn_queued_request {
     std::vector<std::vector<llama_token>> rerank_prompt_tokens;
     std::function<void(int32_t, const std::vector<float>&)> on_rerank;
 
+    std::shared_ptr<llama_rn_decision_job> decision_job;
+
     // State management
     std::string load_state_path;       // File path to load state from before processing
     std::string save_state_path;       // File path to save state to after completion
@@ -91,8 +100,8 @@ struct llama_rn_slot_manager {
     // Parent context reference
     llama_rn_context* parent_ctx;
 
-    // Slot pool
-    std::vector<llama_rn_slot> slots;
+    // Slots own non-copyable batches; grow the pool without relocating them.
+    std::deque<llama_rn_slot> slots;
     int32_t n_parallel;                    // Number of parallel slots
 
     // Request queue
@@ -100,7 +109,7 @@ struct llama_rn_slot_manager {
 
     // Request tracking
     std::map<int32_t, llama_rn_slot*> active_requests;  // request_id -> slot
-    int32_t next_request_id;
+    std::atomic<int32_t> next_request_id;
 
     // Batch processing
     llama_batch batch;
@@ -144,6 +153,8 @@ struct llama_rn_slot_manager {
     bool init(int32_t n_parallel, int32_t n_batch, int32_t n_ctx);
 
     // Request management
+    int32_t reserve_request_id();
+
     int32_t queue_request(
         const common_params& params,
         const std::vector<llama_token>& prompt,
@@ -160,27 +171,38 @@ struct llama_rn_slot_manager {
         int32_t load_state_size,
         int32_t save_state_size,
         std::function<void(const completion_token_output&)> on_token,
-        std::function<void(llama_rn_slot*)> on_complete
+        std::function<void(llama_rn_slot*)> on_complete,
+        int32_t request_id = -1
     );
 
     int32_t queue_embedding_request(
         const std::vector<llama_token>& tokens,
         int embd_normalize,
-        std::function<void(int32_t, const std::vector<float>&)> on_result
+        std::function<void(int32_t, const std::vector<float>&)> on_result,
+        int32_t request_id = -1
     );
 
     int32_t queue_rerank_request(
         const std::string& query,
         const std::vector<std::string>& documents,
         int normalize,
-        std::function<void(int32_t, const std::vector<float>&)> on_results
+        std::function<void(int32_t, const std::vector<float>&)> on_results,
+        int32_t request_id = -1
+    );
+
+    // Throws std::invalid_argument / std::runtime_error if the request cannot be answered;
+    // a failure after it is queued goes to on_result as {"error": message}
+    int32_t queue_decision_request(
+        const json& body,
+        std::function<void(int32_t, const json&)> on_result,
+        int32_t request_id = -1
     );
 
     // Slot management
     llama_rn_slot* get_available_slot(const std::vector<llama_token>& prompt);
     llama_rn_slot* get_slot_by_request_id(int32_t request_id);
     void release_slot(llama_rn_slot* slot);
-    void cancel_request(int32_t request_id);
+    llama_rn_cancel_result cancel_request(int32_t request_id);
 
     // Processing loop management
     void start_processing_loop();
@@ -204,6 +226,10 @@ struct llama_rn_slot_manager {
 
     // Process pending queue
     void process_pending_queue();
+
+    // Evaluate the next prompt of every slot's decision
+    void process_decision_slots();
+    void reset_decision_sequence(llama_rn_slot & slot);
 
     // Release completed slots
     void release_completed_slots();

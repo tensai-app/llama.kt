@@ -29,17 +29,20 @@ extern "C" {
 // FP16 to FP32 conversion
 
 // 16-bit float
-// on Arm, we use __fp16
+// on Arm, we use __fp16, which requires the IEEE fp16 format: implied on
+// AArch64, selected by -mfp16-format=ieee on 32 bit Arm, where the compiler
+// may otherwise reject the type
 // on x86, we use uint16_t
 //
 // for old CUDA compilers (<= 11), we use uint16_t: ref https://github.com/ggml-org/llama.cpp/pull/10616
 // for     MUSA compilers        , we use uint16_t: ref https://github.com/ggml-org/llama.cpp/pull/11843
 //
-#if defined(__ARM_NEON) && !(defined(__CUDACC__) && __CUDACC_VER_MAJOR__ <= 11) && !defined(__MUSACC__)
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE) && !(defined(__CUDACC__) && __CUDACC_VER_MAJOR__ <= 11) && !defined(__MUSACC__)
     #define LM_GGML_CPU_COMPUTE_FP16_TO_FP32(x) neon_compute_fp16_to_fp32(x)
     #define LM_GGML_CPU_COMPUTE_FP32_TO_FP16(x) neon_compute_fp32_to_fp16(x)
 
     #define LM_GGML_CPU_FP16_TO_FP32(x) LM_GGML_CPU_COMPUTE_FP16_TO_FP32(x)
+    #define LM_GGML_CPU_FP32_TO_FP16(x) LM_GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 
     static inline float neon_compute_fp16_to_fp32(lm_ggml_fp16_t h) {
         __fp16 tmp;
@@ -138,9 +141,25 @@ extern float lm_ggml_table_f32_ue4m3[1 << 8];
 #define LM_GGML_CPU_UE4M3_TO_FP32(x) lm_ggml_ue4m3_to_fp32(x)
 #endif
 
-// On ARM NEON, it's quicker to directly convert x -> x instead of calling into lm_ggml_lookup_fp16_to_fp32,
-// so we define LM_GGML_CPU_FP16_TO_FP32 and LM_GGML_CPU_FP32_TO_FP16 elsewhere for NEON.
-// This is also true for POWER9.
+// Pre AVX512 CPUs (AVX2 with F16C, such as i5-8th gen or i7-4790)
+// do not produce codegen as checks below don't test for __F16C__
+// but this check does.
+#if defined(__F16C__)
+// force FP16 -> FP32 conversion to use LUT instead
+// see: https://github.com/ggml-org/llama.cpp/issues/30342
+//#define LM_GGML_CPU_FP16_TO_FP32(x) LM_GGML_CPU_COMPUTE_FP16_TO_FP32(x)
+#define LM_GGML_CPU_FP32_TO_FP16(x) LM_GGML_CPU_COMPUTE_FP32_TO_FP16(x)
+#endif
+
+// a branch that defines a LM_GGML_CPU_COMPUTE_* macro must also select it, or the fallback takes over silently
+#if defined(LM_GGML_CPU_COMPUTE_FP16_TO_FP32) && !defined(LM_GGML_CPU_FP16_TO_FP32) && !defined(__F16C__) // see: https://github.com/ggml-org/llama.cpp/issues/30342
+#error "a branch defined LM_GGML_CPU_COMPUTE_FP16_TO_FP32 without selecting it as LM_GGML_CPU_FP16_TO_FP32"
+#endif
+#if defined(LM_GGML_CPU_COMPUTE_FP32_TO_FP16) && !defined(LM_GGML_CPU_FP32_TO_FP16)
+#error "a branch defined LM_GGML_CPU_COMPUTE_FP32_TO_FP16 without selecting it as LM_GGML_CPU_FP32_TO_FP16"
+#endif
+
+// fall back to the lookup table / the portable software conversion for whichever direction no branch selected
 #if !defined(LM_GGML_CPU_FP16_TO_FP32)
 inline static float lm_ggml_lookup_fp16_to_fp32(lm_ggml_fp16_t f) {
     uint16_t s;
@@ -326,7 +345,7 @@ inline static float lm_ggml_lookup_fp16_to_fp32(lm_ggml_fp16_t f) {
     #define LM_GGML_F16_VEC_REDUCE         LM_GGML_F32Cx4_REDUCE
 #endif
 
-#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA) && defined(__ARM_FP16_FORMAT_IEEE)
 
 #define LM_GGML_SIMD
 
@@ -1221,6 +1240,24 @@ static inline void __lsx_f16x4_store(lm_ggml_fp16_t * x, __m128 y) {
 #define LM_GGML_F16_STEP LM_GGML_F32_STEP
 #define LM_GGML_F16_EPR  LM_GGML_F32_EPR
 
+static inline uint32x4_t __lzs_f32cx4_to_f16(float32x4_t v_f) {
+    float32x4_t v_base = vec_mul(vec_mul(vec_abs(v_f), vec_splats(0x1.0p+112f)), vec_splats(0x1.0p-110f));
+
+    const uint32x4_t v_w      = (uint32x4_t)v_f;
+    const uint32x4_t v_shl1_w = vec_add(v_w, v_w);
+    const uint32x4_t v_sign   = vec_and(v_w, vec_splats(UINT32_C(0x80000000)));
+    const uint32x4_t v_bias   = vec_max(vec_and(v_shl1_w, vec_splats(UINT32_C(0xFF000000))), vec_splats(UINT32_C(0x71000000)));
+
+    v_base = vec_add((float32x4_t)vec_add(vec_sr(v_bias, 1), vec_splats(UINT32_C(0x07800000))), v_base);
+
+    const uint32x4_t v_bits    = (uint32x4_t)v_base;
+    const uint32x4_t v_nonsign = vec_add(vec_and(vec_sr(v_bits, 13), vec_splats(UINT32_C(0x00007C00))),
+                                         vec_and(v_bits, vec_splats(UINT32_C(0x00000FFF))));
+    const uint32x4_t v_is_nan  = (uint32x4_t)vec_cmpgt(v_shl1_w, vec_splats(UINT32_C(0xFF000000)));
+
+    return vec_or(vec_sr(v_sign, 16), vec_sel(v_nonsign, vec_splats(UINT32_C(0x7E00)), v_is_nan));
+}
+
 static inline float32x4_t __lzs_f16cx4_load(const lm_ggml_fp16_t * x) {
     float tmp[4];
 
@@ -1234,15 +1271,9 @@ static inline float32x4_t __lzs_f16cx4_load(const lm_ggml_fp16_t * x) {
 }
 
 static inline void __lzs_f16cx4_store(lm_ggml_fp16_t * x, float32x4_t v_y) {
-    float arr[4];
-
-    // note: keep type-cast here to prevent compiler bugs
-    // see: https://github.com/ggml-org/llama.cpp/issues/12846
-    vec_xst(v_y, 0, (float *)(arr));
-
-    for (int i = 0; i < 4; i++) {
-        x[i] = LM_GGML_CPU_FP32_TO_FP16(arr[i]);
-    }
+    const uint32x4_t v_h = __lzs_f32cx4_to_f16(v_y);
+    const uint64_t   tmp = ((uint64x2_t)vec_pack(v_h, v_h))[0];
+    memcpy(x, &tmp, sizeof(tmp));
 }
 
 #define LM_GGML_F16_VEC                LM_GGML_F32x4
@@ -1311,6 +1342,33 @@ static inline void __lzs_f16cx4_store(lm_ggml_fp16_t * x, float32x4_t v_y) {
 #define LM_GGML_F32_ARR (LM_GGML_F32_STEP/LM_GGML_F32_EPR)
 #define LM_GGML_F16_ARR (LM_GGML_F16_STEP/LM_GGML_F16_EPR)
 #endif
+
+// LM_GGML_F16_DOT_*
+// like LM_GGML_F16_* but for dot products which need F32 accumulation on AVX512-FP16
+
+#if defined(__AVX512FP16__)
+
+#define LM_GGML_F16_DOT_STEP           LM_GGML_F32_STEP
+#define LM_GGML_F16_DOT_EPR            LM_GGML_F32_EPR
+#define LM_GGML_F16_DOT_ARR            LM_GGML_F32_ARR
+#define LM_GGML_F16_DOT_VEC            LM_GGML_F32x16
+#define LM_GGML_F16_DOT_VEC_ZERO       LM_GGML_F32x16_ZERO
+#define LM_GGML_F16_DOT_VEC_LOAD(p, i) _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(p)))
+#define LM_GGML_F16_DOT_VEC_FMA        LM_GGML_F32x16_FMA
+#define LM_GGML_F16_DOT_VEC_REDUCE     LM_GGML_F32x16_REDUCE
+
+#else
+
+#define LM_GGML_F16_DOT_STEP           LM_GGML_F16_STEP
+#define LM_GGML_F16_DOT_EPR            LM_GGML_F16_EPR
+#define LM_GGML_F16_DOT_ARR            LM_GGML_F16_ARR
+#define LM_GGML_F16_DOT_VEC            LM_GGML_F16_VEC
+#define LM_GGML_F16_DOT_VEC_ZERO       LM_GGML_F16_VEC_ZERO
+#define LM_GGML_F16_DOT_VEC_LOAD       LM_GGML_F16_VEC_LOAD
+#define LM_GGML_F16_DOT_VEC_FMA        LM_GGML_F16_VEC_FMA
+#define LM_GGML_F16_DOT_VEC_REDUCE     LM_GGML_F16_VEC_REDUCE
+
+#endif // defined(__AVX512FP16__)
 
 #ifdef __cplusplus
 }

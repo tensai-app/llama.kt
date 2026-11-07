@@ -26,7 +26,16 @@ LLAMA_RN_URL="https://github.com/mybigday/llama.rn"
 LLAMA_RN_REV_FILE="$ROOT_DIR/scripts/llama.rn.rev"
 LLAMA_RN_REF_DIR="${LLAMA_RN_REF_DIR:-/tmp/llama.rn-ref}"
 LLAMA_RN_CPP="$LLAMA_RN_REF_DIR/cpp"
-PATCHES_SRC="$LLAMA_RN_REF_DIR/scripts/patches"
+# Since llama.rn 0.13 its llama.cpp patches are -p1 diffs in upstream's layout,
+# one directory per vendored dependency (LKT-52).
+PATCHES_SRC="$LLAMA_RN_REF_DIR/scripts/patches/llama.cpp"
+LLAMA_RN_VERSIONS="$LLAMA_RN_REF_DIR/vendor/VERSIONS"
+
+# The llama.cpp tree the copies below read: the submodule, exported and patched
+# with llama.rn's patches (see "Patched llama.cpp tree" below). The submodule
+# itself is never modified.
+LLAMA_SRC=$(mktemp -d "${TMPDIR:-/tmp}/llama-kt-src.XXXXXX")
+trap 'rm -rf "$LLAMA_SRC"' EXIT
 
 echo "==> Init llama.cpp submodule..."
 git -C "$ROOT_DIR" submodule init "third_party/llama.cpp"
@@ -43,6 +52,10 @@ else
 fi
 if [ "$LLAMA_HAVE" = "none" ]; then
   git -C "$ROOT_DIR" submodule update "third_party/llama.cpp"
+elif [ "$LLAMA_WANT" != "$LLAMA_HAVE" ] && [ "${LLAMA_KT_UNCOMMITTED_PIN:-}" = "1" ]; then
+  # Generating the vendored tree for a bump under review, before its gitlink is
+  # committed: the caller says the checkout is the pin on purpose.
+  echo "  WARNING: generating from the checked-out llama.cpp $LLAMA_HAVE, HEAD pins $LLAMA_WANT (LLAMA_KT_UNCOMMITTED_PIN=1)"
 elif [ "$LLAMA_WANT" != "$LLAMA_HAVE" ]; then
   # The wanted commit is read from HEAD, so a pin checked out but not yet
   # committed (step 1 of a bump) differs from it exactly like a submodule left
@@ -108,6 +121,72 @@ if [ -n "$(git -C "$LLAMA_RN_REF_DIR" status --porcelain -- cpp scripts/patches)
 fi
 echo "  llama.rn at $LLAMA_RN_REV"
 
+# The rn-* glue and llama.rn's patches are written against the llama.cpp commit
+# llama.rn vendors: the submodule must be that very commit.
+LLAMA_RN_LLAMA=$(sed -n 's/^LLAMA_CPP_COMMIT=//p' "$LLAMA_RN_VERSIONS" 2>/dev/null)
+LLAMA_HAVE=$(git -C "$LLAMA_DIR" rev-parse HEAD)
+if [ "$LLAMA_RN_LLAMA" != "$LLAMA_HAVE" ]; then
+  echo "ERROR: llama.rn $LLAMA_RN_REV vendors llama.cpp ${LLAMA_RN_LLAMA:-?} ($LLAMA_RN_VERSIONS)," >&2
+  echo "  but third_party/llama.cpp is at $LLAMA_HAVE. Move one to match the other." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Patched llama.cpp tree
+# ---------------------------------------------------------------------------
+# llama.rn's patches apply to upstream's layout, so they go on a pristine export
+# of the submodule before anything is copied or renamed. Only those whose target
+# we deliberately don't vendor may be skipped; any other that fails means the
+# two pins disagree, and a skipped hunk would be a fix silently lost.
+echo "==> Exporting llama.cpp and applying llama.rn's patches..."
+git -C "$LLAMA_DIR" archive --format=tar HEAD | tar -x -C "$LLAMA_SRC"
+if [ ! -d "$PATCHES_SRC" ]; then
+  echo "ERROR: llama.rn's llama.cpp patches not found at $PATCHES_SRC"
+  exit 1
+fi
+patches_not_vendored=(
+  ggml-metal-flash-attn-smem.patch   # ggml-metal/: iOS only
+  ggml-metal-mul-mv-id-tiitg.patch   # ggml-metal/: iOS only
+  ggml-hexagon.cpp.patch             # ggml-hexagon/: not needed
+)
+for patch_file in "$PATCHES_SRC"/*.patch; do
+  [ -f "$patch_file" ] || continue
+  patch_name=$(basename "$patch_file")
+  skip=0
+  for not_vendored in "${patches_not_vendored[@]}"; do
+    [ "$patch_name" = "$not_vendored" ] && skip=1
+  done
+  if [ "$skip" -eq 1 ]; then
+    echo "  Skipping patch (target not vendored): $patch_name"
+    continue
+  fi
+  # --forward: a patch upstream has since merged reads as reversed, and plain
+  # --batch would then un-apply it (it did for models-clef.cpp.patch at b11960).
+  # --fuzz=0 here: only an exact reverse match counts as already merged.
+  if ! patch --dry-run --batch --forward --quiet --fuzz=0 -p1 -d "$LLAMA_SRC" < "$patch_file" >/dev/null 2>&1 \
+      && patch --dry-run --batch --reverse --quiet --fuzz=0 -p1 -d "$LLAMA_SRC" < "$patch_file" >/dev/null 2>&1; then
+    echo "  Skipping patch (already in llama.cpp): $patch_name"
+    continue
+  fi
+  echo "  Applying patch: $patch_name"
+  # A non-zero exit means at least one hunk was rejected. Default fuzz, as llama.rn's
+  # own sync-vendor.sh applies them: at rc.9, barbet-llama-arch.cpp.patch and
+  # log.cpp.patch need it.
+  if ! patch --batch --forward --quiet -p1 -d "$LLAMA_SRC" < "$patch_file"; then
+    echo "  ERROR: llama.rn patch $patch_name does not apply to llama.cpp $LLAMA_HAVE."
+    echo "  Resolve deliberately, do not skip it (see patches_not_vendored)."
+    exit 1
+  fi
+  # llama.rn commits the tree its patches produce (vendor/llama.cpp): a hunk fuzz put
+  # anywhere else shows up as a difference here.
+  for f in $(sed -n 's|^+++ b/\([^[:space:]]*\).*|\1|p' "$patch_file"); do
+    if ! cmp -s "$LLAMA_SRC/$f" "$LLAMA_RN_REF_DIR/vendor/llama.cpp/$f"; then
+      echo "  ERROR: $f after $patch_name differs from llama.rn's vendor/llama.cpp/$f."
+      exit 1
+    fi
+  done
+done
+
 echo "==> Creating output directory: $CPP_DIR"
 mkdir -p "$CPP_DIR"
 mkdir -p "$CPP_DIR/ggml-cpu/amx"
@@ -126,14 +205,14 @@ mkdir -p "$CPP_DIR/spirv-headers/spirv/unified1"
 # ggml public headers
 # ---------------------------------------------------------------------------
 echo "==> Copying ggml headers..."
-cp "$LLAMA_DIR/ggml/include/ggml.h"            "$CPP_DIR/ggml.h"
-cp "$LLAMA_DIR/ggml/include/ggml-alloc.h"      "$CPP_DIR/ggml-alloc.h"
-cp "$LLAMA_DIR/ggml/include/ggml-backend.h"    "$CPP_DIR/ggml-backend.h"
-cp "$LLAMA_DIR/ggml/include/ggml-cpu.h"        "$CPP_DIR/ggml-cpu.h"
-cp "$LLAMA_DIR/ggml/include/ggml-cpp.h"        "$CPP_DIR/ggml-cpp.h"
-cp "$LLAMA_DIR/ggml/include/ggml-opt.h"        "$CPP_DIR/ggml-opt.h"
-cp "$LLAMA_DIR/ggml/include/ggml-opencl.h"     "$CPP_DIR/ggml-opencl.h"
-cp "$LLAMA_DIR/ggml/include/gguf.h"            "$CPP_DIR/gguf.h"
+cp "$LLAMA_SRC/ggml/include/ggml.h"            "$CPP_DIR/ggml.h"
+cp "$LLAMA_SRC/ggml/include/ggml-alloc.h"      "$CPP_DIR/ggml-alloc.h"
+cp "$LLAMA_SRC/ggml/include/ggml-backend.h"    "$CPP_DIR/ggml-backend.h"
+cp "$LLAMA_SRC/ggml/include/ggml-cpu.h"        "$CPP_DIR/ggml-cpu.h"
+cp "$LLAMA_SRC/ggml/include/ggml-cpp.h"        "$CPP_DIR/ggml-cpp.h"
+cp "$LLAMA_SRC/ggml/include/ggml-opt.h"        "$CPP_DIR/ggml-opt.h"
+cp "$LLAMA_SRC/ggml/include/ggml-opencl.h"     "$CPP_DIR/ggml-opencl.h"
+cp "$LLAMA_SRC/ggml/include/gguf.h"            "$CPP_DIR/gguf.h"
 # ggml-metal.h + ggml-blas.h + ggml-hexagon.h skipped (iOS / blas / hexagon only)
 
 # ---------------------------------------------------------------------------
@@ -141,7 +220,7 @@ cp "$LLAMA_DIR/ggml/include/gguf.h"            "$CPP_DIR/gguf.h"
 # ---------------------------------------------------------------------------
 echo "==> Copying ggml-opencl..."
 rm -rf "$CPP_DIR/ggml-opencl"
-cp -r "$LLAMA_DIR/ggml/src/ggml-opencl" "$CPP_DIR/"
+cp -r "$LLAMA_SRC/ggml/src/ggml-opencl" "$CPP_DIR/"
 rm -f "$CPP_DIR/ggml-opencl/CMakeLists.txt"
 
 # ---------------------------------------------------------------------------
@@ -149,9 +228,9 @@ rm -f "$CPP_DIR/ggml-opencl/CMakeLists.txt"
 # ---------------------------------------------------------------------------
 echo "==> Setting up ggml-vulkan..."
 
-# 1. Copy ggml-vulkan.cpp and ggml-vulkan.h from submodule
-cp "$LLAMA_DIR/ggml/src/ggml-vulkan/ggml-vulkan.cpp" "$CPP_DIR/ggml-vulkan/"
-cp "$LLAMA_DIR/ggml/include/ggml-vulkan.h"            "$CPP_DIR/ggml-vulkan/"
+# 1. Copy the ggml-vulkan sources (split over several files since b11960) and ggml-vulkan.h
+cp "$LLAMA_SRC/ggml/src/ggml-vulkan/"*.cpp "$LLAMA_SRC/ggml/src/ggml-vulkan/"*.h "$CPP_DIR/ggml-vulkan/"
+cp "$LLAMA_SRC/ggml/include/ggml-vulkan.h"            "$CPP_DIR/ggml-vulkan/"
 
 # 2. Build vulkan-shaders-gen for host and generate SPIR-V shaders
 #    Prerequisites: cmake, glslc (from shaderc/glslang), g++
@@ -197,186 +276,153 @@ echo "  Vulkan setup complete ($(ls "$CPP_DIR/ggml-vulkan/shaders/" | wc -l) sha
 # ggml-cpu
 # ---------------------------------------------------------------------------
 echo "==> Copying ggml-cpu..."
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/ggml-cpu.c"         "$CPP_DIR/ggml-cpu/ggml-cpu.c"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/ggml-cpu.cpp"       "$CPP_DIR/ggml-cpu/ggml-cpu.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/ggml-cpu-impl.h"    "$CPP_DIR/ggml-cpu/ggml-cpu-impl.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/quants.h"           "$CPP_DIR/ggml-cpu/quants.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/quants.c"           "$CPP_DIR/ggml-cpu/quants.c"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/arch-fallback.h"    "$CPP_DIR/ggml-cpu/arch-fallback.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/repack.cpp"         "$CPP_DIR/ggml-cpu/repack.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/repack.h"           "$CPP_DIR/ggml-cpu/repack.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/traits.h"           "$CPP_DIR/ggml-cpu/traits.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/traits.cpp"         "$CPP_DIR/ggml-cpu/traits.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/common.h"           "$CPP_DIR/ggml-cpu/common.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/unary-ops.h"        "$CPP_DIR/ggml-cpu/unary-ops.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/unary-ops.cpp"      "$CPP_DIR/ggml-cpu/unary-ops.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/binary-ops.h"       "$CPP_DIR/ggml-cpu/binary-ops.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/binary-ops.cpp"     "$CPP_DIR/ggml-cpu/binary-ops.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/vec.h"              "$CPP_DIR/ggml-cpu/vec.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/vec.cpp"            "$CPP_DIR/ggml-cpu/vec.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/simd-mappings.h"    "$CPP_DIR/ggml-cpu/simd-mappings.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/simd-gemm.h"        "$CPP_DIR/ggml-cpu/simd-gemm.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/ops.h"              "$CPP_DIR/ggml-cpu/ops.h"
-cp "$LLAMA_DIR/ggml/src/ggml-cpu/ops.cpp"            "$CPP_DIR/ggml-cpu/ops.cpp"
-cp -r "$LLAMA_DIR/ggml/src/ggml-cpu/amx"             "$CPP_DIR/ggml-cpu/"
-cp -r "$LLAMA_DIR/ggml/src/ggml-cpu/arch/arm"        "$CPP_DIR/ggml-cpu/arch/"
-cp -r "$LLAMA_DIR/ggml/src/ggml-cpu/arch/x86"        "$CPP_DIR/ggml-cpu/arch/"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/ggml-cpu.c"         "$CPP_DIR/ggml-cpu/ggml-cpu.c"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/ggml-cpu.cpp"       "$CPP_DIR/ggml-cpu/ggml-cpu.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/ggml-cpu-impl.h"    "$CPP_DIR/ggml-cpu/ggml-cpu-impl.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/quants.h"           "$CPP_DIR/ggml-cpu/quants.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/quants.c"           "$CPP_DIR/ggml-cpu/quants.c"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/arch-fallback.h"    "$CPP_DIR/ggml-cpu/arch-fallback.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/repack.cpp"         "$CPP_DIR/ggml-cpu/repack.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/repack.h"           "$CPP_DIR/ggml-cpu/repack.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/traits.h"           "$CPP_DIR/ggml-cpu/traits.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/traits.cpp"         "$CPP_DIR/ggml-cpu/traits.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/common.h"           "$CPP_DIR/ggml-cpu/common.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/unary-ops.h"        "$CPP_DIR/ggml-cpu/unary-ops.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/unary-ops.cpp"      "$CPP_DIR/ggml-cpu/unary-ops.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/binary-ops.h"       "$CPP_DIR/ggml-cpu/binary-ops.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/binary-ops.cpp"     "$CPP_DIR/ggml-cpu/binary-ops.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/vec.h"              "$CPP_DIR/ggml-cpu/vec.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/vec.cpp"            "$CPP_DIR/ggml-cpu/vec.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/simd-mappings.h"    "$CPP_DIR/ggml-cpu/simd-mappings.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/simd-gemm.h"        "$CPP_DIR/ggml-cpu/simd-gemm.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/ops.h"              "$CPP_DIR/ggml-cpu/ops.h"
+cp "$LLAMA_SRC/ggml/src/ggml-cpu/ops.cpp"            "$CPP_DIR/ggml-cpu/ops.cpp"
+cp -r "$LLAMA_SRC/ggml/src/ggml-cpu/amx"             "$CPP_DIR/ggml-cpu/"
+rm -rf "$CPP_DIR/ggml-cpu/tiled"
+cp -r "$LLAMA_SRC/ggml/src/ggml-cpu/tiled"           "$CPP_DIR/ggml-cpu/"
+cp -r "$LLAMA_SRC/ggml/src/ggml-cpu/arch/arm"        "$CPP_DIR/ggml-cpu/arch/"
+cp -r "$LLAMA_SRC/ggml/src/ggml-cpu/arch/x86"        "$CPP_DIR/ggml-cpu/arch/"
 
 # ---------------------------------------------------------------------------
 # ggml core sources
 # ---------------------------------------------------------------------------
 echo "==> Copying ggml core sources..."
-cp "$LLAMA_DIR/ggml/src/ggml.c"                "$CPP_DIR/ggml.c"
-cp "$LLAMA_DIR/ggml/src/ggml-impl.h"           "$CPP_DIR/ggml-impl.h"
-cp "$LLAMA_DIR/ggml/src/ggml-alloc.c"          "$CPP_DIR/ggml-alloc.c"
-cp "$LLAMA_DIR/ggml/src/ggml-backend.cpp"      "$CPP_DIR/ggml-backend.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-backend-impl.h"   "$CPP_DIR/ggml-backend-impl.h"
-cp "$LLAMA_DIR/ggml/src/ggml-backend-reg.cpp"  "$CPP_DIR/ggml-backend-reg.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-backend-meta.cpp" "$CPP_DIR/ggml-backend-meta.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-backend-dl.h"     "$CPP_DIR/ggml-backend-dl.h"
-cp "$LLAMA_DIR/ggml/src/ggml-backend-dl.cpp"   "$CPP_DIR/ggml-backend-dl.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-common.h"         "$CPP_DIR/ggml-common.h"
-cp "$LLAMA_DIR/ggml/src/ggml-opt.cpp"          "$CPP_DIR/ggml-opt.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-quants.h"         "$CPP_DIR/ggml-quants.h"
-cp "$LLAMA_DIR/ggml/src/ggml-quants.c"         "$CPP_DIR/ggml-quants.c"
-cp "$LLAMA_DIR/ggml/src/ggml-threading.cpp"    "$CPP_DIR/ggml-threading.cpp"
-cp "$LLAMA_DIR/ggml/src/ggml-threading.h"      "$CPP_DIR/ggml-threading.h"
-cp "$LLAMA_DIR/ggml/src/gguf.cpp"              "$CPP_DIR/gguf.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml.c"                "$CPP_DIR/ggml.c"
+cp "$LLAMA_SRC/ggml/src/ggml-impl.h"           "$CPP_DIR/ggml-impl.h"
+cp "$LLAMA_SRC/ggml/src/ggml-alloc.c"          "$CPP_DIR/ggml-alloc.c"
+cp "$LLAMA_SRC/ggml/src/ggml-backend.cpp"      "$CPP_DIR/ggml-backend.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-backend-impl.h"   "$CPP_DIR/ggml-backend-impl.h"
+cp "$LLAMA_SRC/ggml/src/ggml-backend-reg.cpp"  "$CPP_DIR/ggml-backend-reg.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-backend-meta.cpp" "$CPP_DIR/ggml-backend-meta.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-backend-dl.h"     "$CPP_DIR/ggml-backend-dl.h"
+cp "$LLAMA_SRC/ggml/src/ggml-backend-dl.cpp"   "$CPP_DIR/ggml-backend-dl.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-common.h"         "$CPP_DIR/ggml-common.h"
+cp "$LLAMA_SRC/ggml/src/ggml-feats.h"          "$CPP_DIR/ggml-feats.h"
+cp "$LLAMA_SRC/ggml/src/ggml-opt.cpp"          "$CPP_DIR/ggml-opt.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-quants.h"         "$CPP_DIR/ggml-quants.h"
+cp "$LLAMA_SRC/ggml/src/ggml-quants.c"         "$CPP_DIR/ggml-quants.c"
+cp "$LLAMA_SRC/ggml/src/ggml-threading.cpp"    "$CPP_DIR/ggml-threading.cpp"
+cp "$LLAMA_SRC/ggml/src/ggml-threading.h"      "$CPP_DIR/ggml-threading.h"
+cp "$LLAMA_SRC/ggml/src/gguf.cpp"              "$CPP_DIR/gguf.cpp"
 
 # ---------------------------------------------------------------------------
 # llama API
 # ---------------------------------------------------------------------------
 echo "==> Copying llama API..."
-cp "$LLAMA_DIR/include/llama.h"                       "$CPP_DIR/llama.h"
-cp "$LLAMA_DIR/include/llama-cpp.h"                   "$CPP_DIR/llama-cpp.h"
+# All of src/ (CMakeLists globs llama*.cpp), so a file upstream adds comes with
+# the bump. Model quantization is not exposed, as in llama.rn. Stale copies go
+# first: a file upstream removed must not keep building here.
+rm -f "$CPP_DIR"/llama*.h "$CPP_DIR"/llama*.cpp "$CPP_DIR"/unicode*.h "$CPP_DIR"/unicode*.cpp
+for f in "$LLAMA_SRC"/src/*.h "$LLAMA_SRC"/src/*.cpp; do
+  [ "$(basename "$f")" = "llama-quant.cpp" ] && continue
+  cp "$f" "$CPP_DIR/"
+done
+cp "$LLAMA_SRC/include/llama.h"                       "$CPP_DIR/llama.h"
+cp "$LLAMA_SRC/include/llama-cpp.h"                   "$CPP_DIR/llama-cpp.h"
 rm -rf "$CPP_DIR/models"
-cp -r "$LLAMA_DIR/src/models"                         "$CPP_DIR/models"
-cp "$LLAMA_DIR/src/llama.cpp"                         "$CPP_DIR/llama.cpp"
-cp "$LLAMA_DIR/src/llama-chat.h"                      "$CPP_DIR/llama-chat.h"
-cp "$LLAMA_DIR/src/llama-chat.cpp"                    "$CPP_DIR/llama-chat.cpp"
-cp "$LLAMA_DIR/src/llama-context.h"                   "$CPP_DIR/llama-context.h"
-cp "$LLAMA_DIR/src/llama-context.cpp"                 "$CPP_DIR/llama-context.cpp"
-cp "$LLAMA_DIR/src/llama-mmap.h"                      "$CPP_DIR/llama-mmap.h"
-cp "$LLAMA_DIR/src/llama-mmap.cpp"                    "$CPP_DIR/llama-mmap.cpp"
-cp "$LLAMA_DIR/src/llama-model-loader.h"              "$CPP_DIR/llama-model-loader.h"
-cp "$LLAMA_DIR/src/llama-model-loader.cpp"            "$CPP_DIR/llama-model-loader.cpp"
-cp "$LLAMA_DIR/src/llama-model-saver.h"               "$CPP_DIR/llama-model-saver.h"
-cp "$LLAMA_DIR/src/llama-model-saver.cpp"             "$CPP_DIR/llama-model-saver.cpp"
-cp "$LLAMA_DIR/src/llama-model.h"                     "$CPP_DIR/llama-model.h"
-cp "$LLAMA_DIR/src/llama-model.cpp"                   "$CPP_DIR/llama-model.cpp"
-cp "$LLAMA_DIR/src/llama-kv-cells.h"                  "$CPP_DIR/llama-kv-cells.h"
-cp "$LLAMA_DIR/src/llama-kv-cache.h"                  "$CPP_DIR/llama-kv-cache.h"
-cp "$LLAMA_DIR/src/llama-kv-cache.cpp"                "$CPP_DIR/llama-kv-cache.cpp"
-cp "$LLAMA_DIR/src/llama-kv-cache-dsa.h"              "$CPP_DIR/llama-kv-cache-dsa.h"
-cp "$LLAMA_DIR/src/llama-kv-cache-dsa.cpp"            "$CPP_DIR/llama-kv-cache-dsa.cpp"
-cp "$LLAMA_DIR/src/llama-kv-cache-dsv4.h"             "$CPP_DIR/llama-kv-cache-dsv4.h"
-cp "$LLAMA_DIR/src/llama-kv-cache-dsv4.cpp"           "$CPP_DIR/llama-kv-cache-dsv4.cpp"
-cp "$LLAMA_DIR/src/llama-kv-cache-iswa.h"             "$CPP_DIR/llama-kv-cache-iswa.h"
-cp "$LLAMA_DIR/src/llama-kv-cache-iswa.cpp"           "$CPP_DIR/llama-kv-cache-iswa.cpp"
-cp "$LLAMA_DIR/src/llama-memory-hybrid.h"             "$CPP_DIR/llama-memory-hybrid.h"
-cp "$LLAMA_DIR/src/llama-memory-hybrid.cpp"           "$CPP_DIR/llama-memory-hybrid.cpp"
-cp "$LLAMA_DIR/src/llama-memory-hybrid-iswa.h"        "$CPP_DIR/llama-memory-hybrid-iswa.h"
-cp "$LLAMA_DIR/src/llama-memory-hybrid-iswa.cpp"      "$CPP_DIR/llama-memory-hybrid-iswa.cpp"
-cp "$LLAMA_DIR/src/llama-memory-recurrent.h"          "$CPP_DIR/llama-memory-recurrent.h"
-cp "$LLAMA_DIR/src/llama-memory-recurrent.cpp"        "$CPP_DIR/llama-memory-recurrent.cpp"
-cp "$LLAMA_DIR/src/llama-adapter.h"                   "$CPP_DIR/llama-adapter.h"
-cp "$LLAMA_DIR/src/llama-adapter.cpp"                 "$CPP_DIR/llama-adapter.cpp"
-cp "$LLAMA_DIR/src/llama-arch.h"                      "$CPP_DIR/llama-arch.h"
-cp "$LLAMA_DIR/src/llama-arch.cpp"                    "$CPP_DIR/llama-arch.cpp"
-cp "$LLAMA_DIR/src/llama-batch.h"                     "$CPP_DIR/llama-batch.h"
-cp "$LLAMA_DIR/src/llama-batch.cpp"                   "$CPP_DIR/llama-batch.cpp"
-cp "$LLAMA_DIR/src/llama-cparams.h"                   "$CPP_DIR/llama-cparams.h"
-cp "$LLAMA_DIR/src/llama-cparams.cpp"                 "$CPP_DIR/llama-cparams.cpp"
-cp "$LLAMA_DIR/src/llama-hparams.h"                   "$CPP_DIR/llama-hparams.h"
-cp "$LLAMA_DIR/src/llama-hparams.cpp"                 "$CPP_DIR/llama-hparams.cpp"
-cp "$LLAMA_DIR/src/llama-impl.h"                      "$CPP_DIR/llama-impl.h"
-cp "$LLAMA_DIR/src/llama-impl.cpp"                    "$CPP_DIR/llama-impl.cpp"
-cp "$LLAMA_DIR/src/llama-ext.h"                       "$CPP_DIR/llama-ext.h"
-cp "$LLAMA_DIR/src/llama-vocab.h"                     "$CPP_DIR/llama-vocab.h"
-cp "$LLAMA_DIR/src/llama-vocab.cpp"                   "$CPP_DIR/llama-vocab.cpp"
-cp "$LLAMA_DIR/src/llama-grammar.h"                   "$CPP_DIR/llama-grammar.h"
-cp "$LLAMA_DIR/src/llama-grammar.cpp"                 "$CPP_DIR/llama-grammar.cpp"
-cp "$LLAMA_DIR/src/llama-sampler.h"                   "$CPP_DIR/llama-sampler.h"
-cp "$LLAMA_DIR/src/llama-sampler.cpp"                 "$CPP_DIR/llama-sampler.cpp"
-cp "$LLAMA_DIR/src/unicode.h"                         "$CPP_DIR/unicode.h"
-cp "$LLAMA_DIR/src/unicode.cpp"                       "$CPP_DIR/unicode.cpp"
-cp "$LLAMA_DIR/src/unicode-data.h"                    "$CPP_DIR/unicode-data.h"
-cp "$LLAMA_DIR/src/unicode-data.cpp"                  "$CPP_DIR/unicode-data.cpp"
-cp "$LLAMA_DIR/src/llama-graph.h"                     "$CPP_DIR/llama-graph.h"
-cp "$LLAMA_DIR/src/llama-graph.cpp"                   "$CPP_DIR/llama-graph.cpp"
-cp "$LLAMA_DIR/src/llama-io.h"                        "$CPP_DIR/llama-io.h"
-cp "$LLAMA_DIR/src/llama-io.cpp"                      "$CPP_DIR/llama-io.cpp"
-cp "$LLAMA_DIR/src/llama-memory.h"                    "$CPP_DIR/llama-memory.h"
-cp "$LLAMA_DIR/src/llama-memory.cpp"                  "$CPP_DIR/llama-memory.cpp"
+cp -r "$LLAMA_SRC/src/models"                         "$CPP_DIR/models"
 
 # ---------------------------------------------------------------------------
 # common
 # ---------------------------------------------------------------------------
 echo "==> Copying common..."
-cp "$LLAMA_DIR/common/log.h"                          "$CPP_DIR/common/log.h"
-cp "$LLAMA_DIR/common/log.cpp"                        "$CPP_DIR/common/log.cpp"
-cp "$LLAMA_DIR/common/common.h"                       "$CPP_DIR/common/common.h"
-cp "$LLAMA_DIR/common/common.cpp"                     "$CPP_DIR/common/common.cpp"
-cp "$LLAMA_DIR/common/sampling.h"                     "$CPP_DIR/common/sampling.h"
-cp "$LLAMA_DIR/common/sampling.cpp"                   "$CPP_DIR/common/sampling.cpp"
-cp "$LLAMA_DIR/common/speculative.h"                  "$CPP_DIR/common/speculative.h"
-cp "$LLAMA_DIR/common/speculative.cpp"                "$CPP_DIR/common/speculative.cpp"
-cp "$LLAMA_DIR/common/ngram-cache.h"                  "$CPP_DIR/common/ngram-cache.h"
-cp "$LLAMA_DIR/common/ngram-cache.cpp"                "$CPP_DIR/common/ngram-cache.cpp"
-cp "$LLAMA_DIR/common/ngram-map.h"                    "$CPP_DIR/common/ngram-map.h"
-cp "$LLAMA_DIR/common/ngram-map.cpp"                  "$CPP_DIR/common/ngram-map.cpp"
-cp "$LLAMA_DIR/common/ngram-mod.h"                    "$CPP_DIR/common/ngram-mod.h"
-cp "$LLAMA_DIR/common/ngram-mod.cpp"                  "$CPP_DIR/common/ngram-mod.cpp"
-cp "$LLAMA_DIR/common/json-schema-to-grammar.h"       "$CPP_DIR/common/json-schema-to-grammar.h"
-cp "$LLAMA_DIR/common/json-schema-to-grammar.cpp"     "$CPP_DIR/common/json-schema-to-grammar.cpp"
+cp "$LLAMA_SRC/common/log.h"                          "$CPP_DIR/common/log.h"
+cp "$LLAMA_SRC/common/log.cpp"                        "$CPP_DIR/common/log.cpp"
+cp "$LLAMA_SRC/common/common.h"                       "$CPP_DIR/common/common.h"
+cp "$LLAMA_SRC/common/common.cpp"                     "$CPP_DIR/common/common.cpp"
+cp "$LLAMA_SRC/common/sampling.h"                     "$CPP_DIR/common/sampling.h"
+cp "$LLAMA_SRC/common/sampling.cpp"                   "$CPP_DIR/common/sampling.cpp"
+cp "$LLAMA_SRC/common/speculative.h"                  "$CPP_DIR/common/speculative.h"
+cp "$LLAMA_SRC/common/speculative.cpp"                "$CPP_DIR/common/speculative.cpp"
+cp "$LLAMA_SRC/common/ngram-cache.h"                  "$CPP_DIR/common/ngram-cache.h"
+cp "$LLAMA_SRC/common/ngram-cache.cpp"                "$CPP_DIR/common/ngram-cache.cpp"
+cp "$LLAMA_SRC/common/ngram-map.h"                    "$CPP_DIR/common/ngram-map.h"
+cp "$LLAMA_SRC/common/ngram-map.cpp"                  "$CPP_DIR/common/ngram-map.cpp"
+cp "$LLAMA_SRC/common/ngram-mod.h"                    "$CPP_DIR/common/ngram-mod.h"
+cp "$LLAMA_SRC/common/ngram-mod.cpp"                  "$CPP_DIR/common/ngram-mod.cpp"
+cp "$LLAMA_SRC/common/json-schema-to-grammar.h"       "$CPP_DIR/common/json-schema-to-grammar.h"
+cp "$LLAMA_SRC/common/json-schema-to-grammar.cpp"     "$CPP_DIR/common/json-schema-to-grammar.cpp"
 # Removed upstream; CMakeLists globs common/*.cpp, so a stale copy would build.
 rm -f "$CPP_DIR/common/json-partial.h" "$CPP_DIR/common/json-partial.cpp"
 rm -f "$CPP_DIR/common/regex-partial.h" "$CPP_DIR/common/regex-partial.cpp"
-cp "$LLAMA_DIR/common/chat.h"                         "$CPP_DIR/common/chat.h"
-cp "$LLAMA_DIR/common/chat.cpp"                       "$CPP_DIR/common/chat.cpp"
-cp "$LLAMA_DIR/common/chat-auto-parser.h"             "$CPP_DIR/common/chat-auto-parser.h"
-cp "$LLAMA_DIR/common/chat-auto-parser-helpers.h"     "$CPP_DIR/common/chat-auto-parser-helpers.h"
-cp "$LLAMA_DIR/common/chat-auto-parser-helpers.cpp"   "$CPP_DIR/common/chat-auto-parser-helpers.cpp"
-cp "$LLAMA_DIR/common/chat-auto-parser-generator.cpp" "$CPP_DIR/common/chat-auto-parser-generator.cpp"
-cp "$LLAMA_DIR/common/chat-diff-analyzer.cpp"         "$CPP_DIR/common/chat-diff-analyzer.cpp"
-cp "$LLAMA_DIR/common/chat-peg-parser.h"              "$CPP_DIR/common/chat-peg-parser.h"
-cp "$LLAMA_DIR/common/chat-peg-parser.cpp"            "$CPP_DIR/common/chat-peg-parser.cpp"
-cp "$LLAMA_DIR/common/peg-parser.h"                   "$CPP_DIR/common/peg-parser.h"
-cp "$LLAMA_DIR/common/peg-parser.cpp"                 "$CPP_DIR/common/peg-parser.cpp"
-cp "$LLAMA_DIR/common/unicode.h"                      "$CPP_DIR/common/unicode.h"
-cp "$LLAMA_DIR/common/unicode.cpp"                    "$CPP_DIR/common/unicode.cpp"
-cp "$LLAMA_DIR/common/reasoning-budget.h"             "$CPP_DIR/common/reasoning-budget.h"
-cp "$LLAMA_DIR/common/reasoning-budget.cpp"           "$CPP_DIR/common/reasoning-budget.cpp"
-cp "$LLAMA_DIR/common/fit.h"                          "$CPP_DIR/common/fit.h"
-cp "$LLAMA_DIR/common/fit.cpp"                        "$CPP_DIR/common/fit.cpp"
-cp "$LLAMA_DIR/common/build-info.h"                   "$CPP_DIR/common/build-info.h"
+cp "$LLAMA_SRC/common/chat.h"                         "$CPP_DIR/common/chat.h"
+cp "$LLAMA_SRC/common/chat.cpp"                       "$CPP_DIR/common/chat.cpp"
+cp "$LLAMA_SRC/common/chat-auto-parser.h"             "$CPP_DIR/common/chat-auto-parser.h"
+cp "$LLAMA_SRC/common/chat-auto-parser-helpers.h"     "$CPP_DIR/common/chat-auto-parser-helpers.h"
+cp "$LLAMA_SRC/common/chat-auto-parser-helpers.cpp"   "$CPP_DIR/common/chat-auto-parser-helpers.cpp"
+cp "$LLAMA_SRC/common/chat-auto-parser-generator.cpp" "$CPP_DIR/common/chat-auto-parser-generator.cpp"
+cp "$LLAMA_SRC/common/chat-diff-analyzer.cpp"         "$CPP_DIR/common/chat-diff-analyzer.cpp"
+cp "$LLAMA_SRC/common/chat-peg-parser.h"              "$CPP_DIR/common/chat-peg-parser.h"
+cp "$LLAMA_SRC/common/chat-peg-parser.cpp"            "$CPP_DIR/common/chat-peg-parser.cpp"
+cp "$LLAMA_SRC/common/peg-parser.h"                   "$CPP_DIR/common/peg-parser.h"
+cp "$LLAMA_SRC/common/peg-parser.cpp"                 "$CPP_DIR/common/peg-parser.cpp"
+cp "$LLAMA_SRC/common/unicode.h"                      "$CPP_DIR/common/unicode.h"
+cp "$LLAMA_SRC/common/unicode.cpp"                    "$CPP_DIR/common/unicode.cpp"
+cp "$LLAMA_SRC/common/reasoning-budget.h"             "$CPP_DIR/common/reasoning-budget.h"
+cp "$LLAMA_SRC/common/reasoning-budget.cpp"           "$CPP_DIR/common/reasoning-budget.cpp"
+cp "$LLAMA_SRC/common/fit.h"                          "$CPP_DIR/common/fit.h"
+cp "$LLAMA_SRC/common/fit.cpp"                        "$CPP_DIR/common/fit.cpp"
+cp "$LLAMA_SRC/common/build-info.h"                   "$CPP_DIR/common/build-info.h"
+cp "$LLAMA_SRC/common/json.h"                         "$CPP_DIR/common/json.h"
+cp "$LLAMA_SRC/common/json.cpp"                       "$CPP_DIR/common/json.cpp"
+cp "$LLAMA_SRC/common/json-schema.h"                  "$CPP_DIR/common/json-schema.h"
+cp "$LLAMA_SRC/common/json-schema.cpp"                "$CPP_DIR/common/json-schema.cpp"
+cp "$LLAMA_SRC/common/trie.h"                         "$CPP_DIR/common/trie.h"
+cp "$LLAMA_SRC/common/trie.cpp"                       "$CPP_DIR/common/trie.cpp"
+cp "$LLAMA_SRC/common/base64.hpp"                     "$CPP_DIR/common/base64.hpp"
+# Per-model chat parsers (one file each), added upstream after b9982.
+rm -rf "$CPP_DIR/common/parsers"
+mkdir -p "$CPP_DIR/common/parsers"
+cp "$LLAMA_SRC/common/parsers/"*.h "$LLAMA_SRC/common/parsers/"*.cpp "$CPP_DIR/common/parsers/"
 
 # ---------------------------------------------------------------------------
 # jinja (template engine, needed by chat.cpp)
 # ---------------------------------------------------------------------------
 echo "==> Copying jinja..."
 rm -rf "$CPP_DIR/common/jinja"
-cp -r "$LLAMA_DIR/common/jinja" "$CPP_DIR/common/jinja"
+cp -r "$LLAMA_SRC/common/jinja" "$CPP_DIR/common/jinja"
 # Rename jinja/string.h to avoid conflict with system <string.h>
 mv "$CPP_DIR/common/jinja/string.h" "$CPP_DIR/common/jinja/jinja-string.h"
 sed -i 's|#include "string.h"|#include "jinja-string.h"|g' "$CPP_DIR/common/jinja/value.h"
 sed -i 's|#include "jinja/string.h"|#include "jinja/jinja-string.h"|g' "$CPP_DIR/common/jinja/string.cpp"
-sed -i 's|#include "../src/llama-ext.h"|#include "../llama-ext.h"|g' "$CPP_DIR/common/fit.h"
-sed -i 's|#include "../src/llama-ext.h"|#include "../llama-ext.h"|g' "$CPP_DIR/common/fit.cpp"
-sed -i 's|#include "../src/llama-ext.h"|#include "../llama-ext.h"|g' "$CPP_DIR/common/speculative.cpp"
+# Upstream finds common/unicode.h through common/'s include dir; here the flattened
+# src/unicode.h comes first, so point at the parent dir.
+sed -i 's|#include "unicode.h"|#include "../unicode.h"|g' "$CPP_DIR/common/jinja/"*.cpp "$CPP_DIR/common/jinja/"*.h
+# src/ is flattened into $CPP_DIR: "../src/llama-ext.h" from common/ is "../llama-ext.h".
+sed -i 's|#include "../src/llama-ext.h"|#include "../llama-ext.h"|g' "$CPP_DIR/common/"*.h "$CPP_DIR/common/"*.cpp
 
 # ---------------------------------------------------------------------------
 # nlohmann + vendors
 # ---------------------------------------------------------------------------
 echo "==> Copying nlohmann + vendors..."
 rm -rf "$CPP_DIR/nlohmann"
-cp -r "$LLAMA_DIR/vendor/nlohmann" "$CPP_DIR/nlohmann"
+cp -r "$LLAMA_SRC/vendor/nlohmann" "$CPP_DIR/nlohmann"
 
 # mtmd audio/image vendors
 rm -rf "$CPP_DIR/tools/mtmd/miniaudio"
 rm -rf "$CPP_DIR/tools/mtmd/stb"
-cp -r "$LLAMA_DIR/vendor/miniaudio" "$CPP_DIR/tools/mtmd/miniaudio"
-cp -r "$LLAMA_DIR/vendor/stb" "$CPP_DIR/tools/mtmd/stb"
+cp -r "$LLAMA_SRC/vendor/miniaudio" "$CPP_DIR/tools/mtmd/miniaudio"
+cp -r "$LLAMA_SRC/vendor/stb" "$CPP_DIR/tools/mtmd/stb"
 
 # ---------------------------------------------------------------------------
 # tools/mtmd (multimodal)
@@ -384,33 +430,46 @@ cp -r "$LLAMA_DIR/vendor/stb" "$CPP_DIR/tools/mtmd/stb"
 echo "==> Copying tools/mtmd..."
 rm -rf "$CPP_DIR/tools/mtmd"/*.{h,cpp} 2>/dev/null || true
 mkdir -p "$CPP_DIR/tools/mtmd"
-cp "$LLAMA_DIR/tools/mtmd/mtmd.h"          "$CPP_DIR/tools/mtmd/mtmd.h"
-cp "$LLAMA_DIR/tools/mtmd/mtmd.cpp"        "$CPP_DIR/tools/mtmd/mtmd.cpp"
-cp "$LLAMA_DIR/tools/mtmd/clip.h"          "$CPP_DIR/tools/mtmd/clip.h"
-cp "$LLAMA_DIR/tools/mtmd/clip.cpp"        "$CPP_DIR/tools/mtmd/clip.cpp"
-cp "$LLAMA_DIR/tools/mtmd/clip-impl.h"     "$CPP_DIR/tools/mtmd/clip-impl.h"
-cp "$LLAMA_DIR/tools/mtmd/clip-model.h"    "$CPP_DIR/tools/mtmd/clip-model.h"
-cp "$LLAMA_DIR/tools/mtmd/clip-graph.h"    "$CPP_DIR/tools/mtmd/clip-graph.h"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-helper.cpp" "$CPP_DIR/tools/mtmd/mtmd-helper.cpp"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-helper.h"   "$CPP_DIR/tools/mtmd/mtmd-helper.h"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-audio.h"    "$CPP_DIR/tools/mtmd/mtmd-audio.h"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-audio.cpp"  "$CPP_DIR/tools/mtmd/mtmd-audio.cpp"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-image.h"    "$CPP_DIR/tools/mtmd/mtmd-image.h"
-cp "$LLAMA_DIR/tools/mtmd/mtmd-image.cpp"  "$CPP_DIR/tools/mtmd/mtmd-image.cpp"
+cp "$LLAMA_SRC/tools/mtmd/mtmd.h"          "$CPP_DIR/tools/mtmd/mtmd.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd.cpp"        "$CPP_DIR/tools/mtmd/mtmd.cpp"
+cp "$LLAMA_SRC/tools/mtmd/clip.h"          "$CPP_DIR/tools/mtmd/clip.h"
+cp "$LLAMA_SRC/tools/mtmd/clip.cpp"        "$CPP_DIR/tools/mtmd/clip.cpp"
+cp "$LLAMA_SRC/tools/mtmd/clip-impl.h"     "$CPP_DIR/tools/mtmd/clip-impl.h"
+cp "$LLAMA_SRC/tools/mtmd/clip-model.h"    "$CPP_DIR/tools/mtmd/clip-model.h"
+cp "$LLAMA_SRC/tools/mtmd/clip-graph.h"    "$CPP_DIR/tools/mtmd/clip-graph.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-helper.cpp" "$CPP_DIR/tools/mtmd/mtmd-helper.cpp"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-helper.h"   "$CPP_DIR/tools/mtmd/mtmd-helper.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-audio.h"    "$CPP_DIR/tools/mtmd/mtmd-audio.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-audio.cpp"  "$CPP_DIR/tools/mtmd/mtmd-audio.cpp"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-image.h"    "$CPP_DIR/tools/mtmd/mtmd-image.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-image.cpp"  "$CPP_DIR/tools/mtmd/mtmd-image.cpp"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-internal.h"      "$CPP_DIR/tools/mtmd/mtmd-internal.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-helper-common.h" "$CPP_DIR/tools/mtmd/mtmd-helper-common.h"
+cp "$LLAMA_SRC/tools/mtmd/mtmd-helper-gen.cpp"  "$CPP_DIR/tools/mtmd/mtmd-helper-gen.cpp"
+# tools/mtmd/ sits two levels under $CPP_DIR, where src/ is flattened.
+sed -i 's|#include "../src/llama-ext.h"|#include "../../llama-ext.h"|g' "$CPP_DIR/tools/mtmd/"*.h "$CPP_DIR/tools/mtmd/"*.cpp
+# mtmd-helper hashes media with the vendored SHA-256 ("hash/hash.h", from $CPP_DIR).
+rm -rf "$CPP_DIR/hash"
+mkdir -p "$CPP_DIR/hash"
+cp -r "$LLAMA_SRC/vendor/hash/"* "$CPP_DIR/hash/"
+rm -f "$CPP_DIR/hash/CMakeLists.txt"
 # mtmd models/debug subdirs — use /* to copy contents, not the dir itself
-if [ -d "$LLAMA_DIR/tools/mtmd/models" ]; then
+if [ -d "$LLAMA_SRC/tools/mtmd/models" ]; then
   mkdir -p "$CPP_DIR/tools/mtmd/models"
-  cp -r "$LLAMA_DIR/tools/mtmd/models/"* "$CPP_DIR/tools/mtmd/models/" 2>/dev/null || true
+  cp -r "$LLAMA_SRC/tools/mtmd/models/"* "$CPP_DIR/tools/mtmd/models/" 2>/dev/null || true
 fi
-if [ -d "$LLAMA_DIR/tools/mtmd/debug" ]; then
+if [ -d "$LLAMA_SRC/tools/mtmd/debug" ]; then
   mkdir -p "$CPP_DIR/tools/mtmd/debug"
-  cp -r "$LLAMA_DIR/tools/mtmd/debug/"* "$CPP_DIR/tools/mtmd/debug/" 2>/dev/null || true
+  cp -r "$LLAMA_SRC/tools/mtmd/debug/"* "$CPP_DIR/tools/mtmd/debug/" 2>/dev/null || true
 fi
 # Copy vendors into mtmd — contents only, mkdir first
 mkdir -p "$CPP_DIR/tools/mtmd/miniaudio"
-cp -r "$LLAMA_DIR/vendor/miniaudio/"* "$CPP_DIR/tools/mtmd/miniaudio/" 2>/dev/null || true
+cp -r "$LLAMA_SRC/vendor/miniaudio/"* "$CPP_DIR/tools/mtmd/miniaudio/" 2>/dev/null || true
 mkdir -p "$CPP_DIR/tools/mtmd/stb"
-cp -r "$LLAMA_DIR/vendor/stb/"* "$CPP_DIR/tools/mtmd/stb/" 2>/dev/null || true
+cp -r "$LLAMA_SRC/vendor/stb/"* "$CPP_DIR/tools/mtmd/stb/" 2>/dev/null || true
+# Their CMake files and nlohmann's already-applied backport patch: not built from here.
+rm -f "$CPP_DIR/nlohmann/CMakeLists.txt" "$CPP_DIR/nlohmann/"*.patch \
+      "$CPP_DIR/tools/mtmd/miniaudio/CMakeLists.txt" "$CPP_DIR/tools/mtmd/stb/CMakeLists.txt"
 
 # ---------------------------------------------------------------------------
 # rn-llama glue (GARDER: engine-facing files, zero JSI)
@@ -431,8 +490,14 @@ cp "$LLAMA_RN_CPP/rn-slot-manager.h"  "$CPP_DIR/rn-slot-manager.h"
 cp "$LLAMA_RN_CPP/rn-slot-manager.cpp" "$CPP_DIR/rn-slot-manager.cpp"
 cp "$LLAMA_RN_CPP/rn-common.hpp"      "$CPP_DIR/rn-common.hpp"
 cp "$LLAMA_RN_CPP/rn-mtmd.hpp"        "$CPP_DIR/rn-mtmd.hpp"
+cp "$LLAMA_RN_CPP/rn-decision.h"      "$CPP_DIR/rn-decision.h"
+cp "$LLAMA_RN_CPP/rn-decision.cpp"    "$CPP_DIR/rn-decision.cpp"
+# rn-tts.cpp is not vendored: since llama.rn 0.13 it drives codec.cpp, a second
+# vendored dependency for TTS, which llama.kt does not expose. The header stays
+# (rn-llama and rn-completion hold a llama_rn_context_tts pointer, always null
+# here) and tensai_tts_stub.cpp defines its methods.
 cp "$LLAMA_RN_CPP/rn-tts.h"           "$CPP_DIR/rn-tts.h"
-cp "$LLAMA_RN_CPP/rn-tts.cpp"         "$CPP_DIR/rn-tts.cpp"
+rm -f "$CPP_DIR/rn-tts.cpp"
 
 # jsi/ — only the two allowed files (JSINativeHeaders.h, ThreadPool.{h,cpp})
 cp "$LLAMA_RN_CPP/jsi/JSINativeHeaders.h"  "$CPP_DIR/jsi/JSINativeHeaders.h"
@@ -448,15 +513,17 @@ files_add_lm_prefix=(
   "$CPP_DIR/ggml-opencl/"*.cpp
   "$CPP_DIR/ggml-opencl/"*.h
 
-  # Vulkan backend (ggml-vulkan.cpp and its header)
-  "$CPP_DIR/ggml-vulkan/ggml-vulkan.cpp"
-  "$CPP_DIR/ggml-vulkan/ggml-vulkan.h"
+  # Vulkan backend (its sources and headers)
+  "$CPP_DIR/ggml-vulkan/"*.cpp
+  "$CPP_DIR/ggml-vulkan/"*.h
 
   "$CPP_DIR/ggml-cpu/"*.h
   "$CPP_DIR/ggml-cpu/"*.c
   "$CPP_DIR/ggml-cpu/"*.cpp
   "$CPP_DIR/ggml-cpu/amx/"*.h
   "$CPP_DIR/ggml-cpu/amx/"*.cpp
+  "$CPP_DIR/ggml-cpu/tiled/"*.h
+  "$CPP_DIR/ggml-cpu/tiled/"*.cpp
   "$CPP_DIR/ggml-cpu/arch/arm/"*.c
   "$CPP_DIR/ggml-cpu/arch/arm/"*.cpp
   "$CPP_DIR/ggml-cpu/arch/x86/"*.c
@@ -476,19 +543,21 @@ files_add_lm_prefix=(
 
   # llama/ggml top-level
   "$CPP_DIR/"*.h
+  "$CPP_DIR/"rn-*.hpp
   "$CPP_DIR/"*.cpp
   "$CPP_DIR/"*.c
 
   "$CPP_DIR/common/"*.h
   "$CPP_DIR/common/"*.cpp
+  "$CPP_DIR/common/parsers/"*.h
+  "$CPP_DIR/common/parsers/"*.cpp
 )
 
 for file in "${files_add_lm_prefix[@]}"; do
   # Skip if glob didn't match
   [ -f "$file" ] || continue
 
-  # Skip rn-* glue (they use lm_ already via the llama.rn vendored headers)
-  [[ "$file" == *"/rn-"* ]] && continue
+  # rn-* glue is rewritten too: since llama.rn 0.13 it spells plain ggml_, like upstream.
 
   # Skip the local ggml-ext.h shim if present
   [[ "$file" == "$CPP_DIR/ggml-ext.h" ]] && continue
@@ -523,56 +592,6 @@ for file in "${files_iq[@]}"; do
   sed -i 's/iq3xs_init_impl/lm_iq3xs_init_impl/g' "$file"
   sed -i 's/iq3xs_free_impl/lm_iq3xs_free_impl/g' "$file"
 done
-
-# ---------------------------------------------------------------------------
-# Apply patches from llama.rn (Android-compatible ones)
-# ---------------------------------------------------------------------------
-echo "==> Applying patches inherited from llama.rn..."
-if [ ! -d "$PATCHES_SRC" ]; then
-  echo "ERROR: inherited patches not found at $PATCHES_SRC"
-  echo "  The pinned llama.rn checkout is incomplete."
-  exit 1
-fi
-
-# The only patches allowed not to apply are those whose target we deliberately
-# don't vendor (see the ggml-metal / ggml-hexagon skips at the top). Everything
-# else failing means the sources moved under the patch — same discipline as the
-# local patches/ below, because a skipped hunk here is a fix silently lost.
-patches_not_vendored=(
-  ggml-metal-flash-attn-smem.patch   # ggml-metal/ggml-metal-ops.cpp — iOS only
-  ggml-metal-mul-mv-id-tiitg.patch   # ggml-metal/ggml-metal.metal   — iOS only
-  ggml-hexagon.cpp.patch             # ggml-hexagon/                 — not needed
-)
-
-for patch_file in "$PATCHES_SRC"/*.patch; do
-  [ -f "$patch_file" ] || continue
-  patch_name=$(basename "$patch_file")
-
-  skip=0
-  for not_vendored in "${patches_not_vendored[@]}"; do
-    [ "$patch_name" = "$not_vendored" ] && skip=1
-  done
-  if [ "$skip" -eq 1 ]; then
-    echo "  Skipping patch (target not vendored): $patch_name"
-    continue
-  fi
-
-  echo "  Applying patch: $patch_name"
-  # --batch: never prompt. A non-zero exit means at least one hunk was rejected.
-  if ! patch --batch -p0 -d "$CPP_DIR" < "$patch_file"; then
-    echo ""
-    echo "  ERROR: inherited patch $patch_name does not apply cleanly."
-    echo "  Either third_party/llama.cpp moved under it, or llama.rn changed it."
-    echo "  Resolve deliberately — do not skip it: bump scripts/llama.rn.rev to a"
-    echo "  llama.rn revision matching the llama.cpp pin, or add $patch_name to"
-    echo "  patches_not_vendored above with the reason. See the .rej files in"
-    echo "  $CPP_DIR."
-    exit 1
-  fi
-done
-
-# Cleanup .orig files
-find "$CPP_DIR" -name "*.orig" -delete
 
 # ---------------------------------------------------------------------------
 # Apply local patches (ours, from patches/ at repo root)
@@ -611,7 +630,33 @@ sed -e "s|@LLAMA_BUILD_NUMBER@|$BUILD_NUMBER|g" \
     -e "s|@LLAMA_BUILD_COMMIT@|$BUILD_COMMIT|g" \
     -e "s|@BUILD_COMPILER@|unknown|g" \
     -e "s|@BUILD_TARGET@|android|g" \
-    "$LLAMA_DIR/common/build-info.cpp.in" > "$CPP_DIR/common/build-info.cpp"
+    "$LLAMA_SRC/common/build-info.cpp.in" > "$CPP_DIR/common/build-info.cpp"
+
+# llama-version.h and ggml-version.h are configure_file() outputs upstream (since
+# b11960). Same values as llama.rn's sync-vendor.sh, without its -dev suffix: the
+# submodule sits on a release tag, where upstream's CMake drops it too. Written after
+# the LM_ rewrite, so ggml's macros get their LM_ prefix here.
+cmake_version() {  # <CMakeLists.txt> <PREFIX>
+  local major minor patch
+  major=$(sed -n "s/^set($2_VERSION_MAJOR \([0-9][0-9]*\))$/\1/p" "$1")
+  minor=$(sed -n "s/^set($2_VERSION_MINOR \([0-9][0-9]*\))$/\1/p" "$1")
+  patch=$(sed -n "s/^set($2_VERSION_PATCH \([0-9][0-9]*\))$/\1/p" "$1")
+  if [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ]; then
+    echo "ERROR: cannot read $2_VERSION_* from $1" >&2
+    exit 1
+  fi
+  echo "$major.$minor.$patch"
+}
+# Assigned first: an exit inside $(...) in sed's arguments would not stop set -e.
+LLAMA_VERSION=$(cmake_version "$LLAMA_SRC/CMakeLists.txt" LLAMA)
+GGML_VERSION=$(cmake_version "$LLAMA_SRC/ggml/CMakeLists.txt" GGML)
+sed -e "s|@LLAMA_VERSION@|$LLAMA_VERSION|g" \
+    -e "s|@LLAMA_BUILD_COMMIT@|$BUILD_COMMIT|g" \
+    "$LLAMA_SRC/src/llama-version.h.in" > "$CPP_DIR/llama-version.h"
+sed -e "s|@GGML_VERSION@|$GGML_VERSION|g" \
+    -e "s|@GGML_BUILD_COMMIT@|$BUILD_COMMIT|g" \
+    -e "s|define GGML_|define LM_GGML_|g" \
+    "$LLAMA_SRC/ggml/src/ggml-version.h.in" > "$CPP_DIR/ggml-version.h"
 
 echo ""
 echo "==> Bootstrap complete!"

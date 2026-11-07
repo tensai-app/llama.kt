@@ -58,13 +58,7 @@ lm_ggml_cgraph * clip_graph_exaone4_5::build() {
         lm_ggml_set_name(inv_window_idx, "inv_window_idx");
         lm_ggml_set_input(inv_window_idx);
 
-        window_mask = lm_ggml_new_tensor_2d(ctx0, LM_GGML_TYPE_F32, n_pos, n_pos);
-        lm_ggml_set_name(window_mask, "window_mask");
-        lm_ggml_set_input(window_mask);
-
-        if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
-            window_mask = lm_ggml_cast(ctx0, window_mask, LM_GGML_TYPE_F16);
-        }
+        window_mask = build_inp_attn_mask(n_pos, n_pos);
     }
 
     lm_ggml_tensor * inpL = inp;

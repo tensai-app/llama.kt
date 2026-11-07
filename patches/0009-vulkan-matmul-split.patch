@@ -1,17 +1,14 @@
 diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-index 6b91282..a71298c 100644
 --- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
 +++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-@@ -94,6 +94,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
- #include "ggml-backend-impl.h"
- 
- #include "ggml-vulkan-shaders.hpp"
+@@ -1,4 +1,5 @@
+ #include "ggml-vulkan-common.h"
 +#include "tensai_vk_split.h"
  
- // remove this once it's more widely available in the SDK
- #if !defined(VK_KHR_shader_bfloat16)
-@@ -8730,6 +8731,51 @@ static vk_pipeline lm_ggml_vk_get_64b_indexing_pipeline(lm_ggml_backend_vk_conte
-     return pipeline;
+ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
+     vk::PhysicalDeviceProperties props = device.getProperties();
+@@ -6504,6 +6505,52 @@
+     return f16_type;
  }
  
 +// Tensai: LM_GGML_VK_MATMUL_SPLIT_MFLOPS (MFLOP per dispatch, unset or 0 = off). A prefill matmul is
@@ -59,21 +56,24 @@ index 6b91282..a71298c 100644
 +    lm_ggml_vk_sync_buffers(ctx, subctx);
 +}
 +
++
  static void lm_ggml_vk_mul_mat_q_f16(lm_ggml_backend_vk_context * ctx, vk_context& subctx, const lm_ggml_tensor * src0, const lm_ggml_tensor * src1, lm_ggml_tensor * dst, bool disable_split_k) {
      VK_LOG_DEBUG("lm_ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << lm_ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
      std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << lm_ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
-@@ -8980,15 +9026,45 @@ static void lm_ggml_vk_mul_mat_q_f16(lm_ggml_backend_vk_context * ctx, vk_contex
-         stride_batch_y = src1->nb[0] / lm_ggml_type_size(src1->type);
-     }
+@@ -6759,16 +6806,48 @@
+         ? (quantize_y ? (uint64_t)(ne10 / lm_ggml_blck_size(LM_GGML_TYPE_Q8_1)) * lm_ggml_type_size(LM_GGML_TYPE_Q8_1) : (uint64_t)ne10 * sizeof(lm_ggml_fp16_t))
+         : (uint64_t)src1->nb[1];
  
 +    // Tensai: split along M. Only the plain case: one batch (the A slice is then a single contiguous
-+    // row range), no split-k (its reduce sums in a different order), no 64-bit indexing pipeline, and
-+    // base offsets of A and D already aligned (the UMA host-pointer path can hand out unaligned ones).
++    // row range), A bound as one contiguous block, no split-k (its reduce sums in a different order), no
++    // 64-bit indexing pipeline, and base offsets of A and D already aligned (the UMA host-pointer path can
++    // hand out unaligned ones). A chunk ends on a whole tile (row_unit), so only the last one reaches the
++    // end of its bound range, which is where A ends, as the partial-tile reads need.
 +    const uint64_t split_budget = lm_ggml_vk_matmul_split_flops();
 +    const uint64_t offset_align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
 +    uint64_t split_rows = ne01;
 +    if (split_budget != 0 && !vk_perf_logger_enabled && split_k == 1 && pipeline->wg_denoms[0] != 0 &&
-+        ne12*ne13 == 1 && ne02*ne03 == 1 && x_sz % ne01 == 0 &&
++        ne12*ne13 == 1 && ne02*ne03 == 1 && x_range == x_sz && x_sz % ne01 == 0 &&
 +        (offset_align == 0 || (x_buf_offset % offset_align == 0 && d_buf_offset % offset_align == 0)) &&
 +        lm_ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange) {
 +        const uint64_t unit = tensai_vk::row_unit(pipeline->wg_denoms[0], x_sz / ne01, sizeof(float), offset_align);
@@ -91,11 +91,12 @@ index 6b91282..a71298c 100644
      // compute
 -    lm_ggml_vk_matmul(
 -        ctx, subctx, pipeline,
--        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+-        { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
 -        lm_ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
 -        ne01, ne11, ne10,
 -        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
--        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
+-        b_col_bytes, (uint64_t)dst->nb[1]
 -    );  // NOLINT
 +    for (uint64_t row0 = 0; row0 < ne01; row0 += split_rows) {
 +        const uint64_t rows = std::min(split_rows, ne01 - row0);
@@ -106,17 +107,18 @@ index 6b91282..a71298c 100644
 +        }
 +        lm_ggml_vk_matmul(
 +            ctx, subctx, pipeline,
-+            { d_X, x_buf_offset + x_off, x_sz - x_off }, { d_Y, y_buf_offset, y_sz },
++            { d_X, x_buf_offset + x_off, x_range - x_off }, { d_Y, y_buf_offset, y_range },
 +            lm_ggml_vk_subbuffer(ctx, d_D, d_buf_offset + d_off), { ctx->prealloc_split_k, 0, d_sz * split_k },
 +            (uint32_t) rows, ne11, ne10,
 +            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-+            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
++            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
++            b_col_bytes, (uint64_t)dst->nb[1]
 +        );  // NOLINT
 +    }
  
      if (x_non_contig || qx_needs_dequant) {
          ctx->prealloc_x_need_sync = true;
-@@ -16473,6 +16549,15 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
+@@ -14600,6 +14679,15 @@
          flops_per_submit = submit_mflops_override * 1'000'000ULL;
      }
  
@@ -129,15 +131,15 @@ index 6b91282..a71298c 100644
 +        flops_per_submit = matmul_split_flops;
 +    }
 +
-     for (int i = 0; i < cgraph->n_nodes; i++) {
-         if (first_node_in_batch) {
-             submit_node_idx = i;
-@@ -16729,7 +16814,7 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
-             first_node_in_batch = true;
-             submitted_nodes = 0;
-             batch_flops = 0;
--            if (submit_count < 3 && submit_mflops_override == 0) {
-+            if (submit_count < 3 && !pin_submit) {
-                 flops_per_submit *= 2;
-             }
-             submit_count++;
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+             try {
+@@ -14624,7 +14712,7 @@
+         first_node_in_batch = true;
+         submitted_nodes = 0;
+         batch_flops = 0;
+-        if (submit_count < 3 && submit_mflops_override == 0) {
++        if (submit_count < 3 && !pin_submit) {
+             flops_per_submit *= 2;
+         }
+         submit_count++;

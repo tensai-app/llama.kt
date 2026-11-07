@@ -1,8 +1,7 @@
 diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-index 3d13183..7d63c8c 100644
 --- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
 +++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-@@ -6032,7 +6032,38 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
+@@ -4314,7 +4314,38 @@
          const uint32_t compute_queue_family_index = lm_ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
          const uint32_t transfer_queue_family_index = lm_ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
  
@@ -42,7 +41,7 @@ index 3d13183..7d63c8c 100644
          device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
  
          std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
-@@ -6458,12 +6489,91 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
+@@ -4783,12 +4814,91 @@
  #endif
          device->name = LM_GGML_VK_NAME + std::to_string(idx);
  
@@ -137,5 +136,5 @@ index 3d13183..7d63c8c 100644
 +            device->device = try_create_device(false);
 +        }
  
-         // Load device-level function pointers.  On Android/Mali the loader does NOT
-         // return device functions from vkGetInstanceProcAddr — init(instance) only
+         if (device->device_fault) {
+             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)

@@ -1,34 +1,5 @@
 #include "models.h"
 
-lm_ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
-    lm_ggml_tensor * inp_raw = build_inp_raw();
-
-    LM_GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
-    LM_GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
-
-    const size_t nb1 = lm_ggml_row_size(inp_raw->type, img.nx());
-    const size_t nb2 = lm_ggml_row_size(inp_raw->type, img.nx() * img.ny());
-
-    if (n_batch == 1) {
-        // still image input
-        return lm_ggml_add(ctx0,
-            lm_ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
-            lm_ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
-    } else if (n_batch == 2) {
-        // 2 frames input (video input)
-        lm_ggml_tensor * inp_0 = lm_ggml_view_3d(ctx0, inp_raw,
-                                    img.nx(), img.ny(), 3, nb1, nb2, 0);
-        lm_ggml_tensor * inp_1 = lm_ggml_view_3d(ctx0, inp_raw,
-                                    img.nx(), img.ny(), 3, nb1, nb2,
-                                    nb2 * 3); // move to the second frame
-        return lm_ggml_add(ctx0,
-            lm_ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_0, patch_size, patch_size, 0, 0, 1, 1),
-            lm_ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_1, patch_size, patch_size, 0, 0, 1, 1));
-    } else {
-        LM_GGML_ASSERT(false && "n_batch > 2 is not supported");
-    }
-}
-
 lm_ggml_cgraph * clip_graph_qwen2vl::build() {
     LM_GGML_ASSERT(model.patch_bias == nullptr);
     LM_GGML_ASSERT(model.class_embedding == nullptr);
@@ -45,7 +16,7 @@ lm_ggml_cgraph * clip_graph_qwen2vl::build() {
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
-    lm_ggml_tensor * inp = build_inp_with_temporal_merge();
+    lm_ggml_tensor * inp = build_inp_temporal_merge();
 
     // second conv dimension
     {
@@ -82,14 +53,7 @@ lm_ggml_cgraph * clip_graph_qwen2vl::build() {
         lm_ggml_set_name(inv_window_idx, "inv_window_idx");
         lm_ggml_set_input(inv_window_idx);
         // mask for window attention
-        window_mask = lm_ggml_new_tensor_2d(ctx0, LM_GGML_TYPE_F32, n_pos, n_pos);
-        lm_ggml_set_name(window_mask, "window_mask");
-        lm_ggml_set_input(window_mask);
-
-        // if flash attn is used, we need to pad the mask and cast to f16
-        if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
-            window_mask = lm_ggml_cast(ctx0, window_mask, LM_GGML_TYPE_F16);
-        }
+        window_mask = build_inp_attn_mask(n_pos, n_pos);
 
         // inpL shape: [n_embd, n_patches_x * n_patches_y, batch_size]
         LM_GGML_ASSERT(batch_size == 1);

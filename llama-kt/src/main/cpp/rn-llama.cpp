@@ -13,6 +13,12 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdio>
+#include <fstream>
+
+#if defined(__ANDROID__)
+#include <android/set_abort_message.h>
+#endif
 
 namespace rnllama {
 
@@ -46,8 +52,80 @@ bool has_speculative_type(const common_params_speculative &speculative, common_s
 
 } // namespace
 
-std::string get_backend_devices_info() {
+size_t backend_dev_count() {
+    return lm_ggml_backend_dev_count();
+}
+
+lm_ggml_backend_dev_t backend_dev_get(size_t index) {
+    return lm_ggml_backend_dev_get(index);
+}
+
+const char * backend_dev_name(lm_ggml_backend_dev_t dev) {
+    return dev ? lm_ggml_backend_dev_name(dev) : nullptr;
+}
+
+enum lm_ggml_backend_dev_type backend_dev_type(lm_ggml_backend_dev_t dev) {
+    return lm_ggml_backend_dev_type(dev);
+}
+
+const char * backend_dev_reg_name(lm_ggml_backend_dev_t dev) {
+    lm_ggml_backend_reg_t reg = dev ? lm_ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? lm_ggml_backend_reg_name(reg) : nullptr;
+}
+
+std::string backend_dev_device_id(lm_ggml_backend_dev_t dev) {
+    if (!dev) {
+        return "";
+    }
+    lm_ggml_backend_dev_props props;
+    lm_ggml_backend_dev_get_props(dev, &props);
+    return props.device_id ? props.device_id : "";
+}
+
+lm_ggml_backend_buffer_type_t backend_cpu_buffer_type() {
+    return lm_ggml_backend_cpu_buffer_type();
+}
+
+bool read_lm_gguf_file_info(const std::string & path, lm_gguf_file_info & info) {
+    struct lm_gguf_init_params params = {
+        /*.no_alloc = */ false,
+        /*.ctx      = */ NULL,
+    };
+    struct lm_gguf_context * ctx = lm_gguf_init_from_file(path.c_str(), params);
+    if (!ctx) {
+        return false;
+    }
+    info.version = lm_gguf_get_version(ctx);
+    info.alignment = lm_gguf_get_alignment(ctx);
+    info.data_offset = lm_gguf_get_data_offset(ctx);
+    const int n_kv = lm_gguf_get_n_kv(ctx);
+    info.kv.clear();
+    info.kv.reserve(n_kv);
+    for (int i = 0; i < n_kv; ++i) {
+        info.kv.emplace_back(lm_gguf_get_key(ctx, i), lm_gguf_kv_to_str(ctx, i));
+    }
+    lm_gguf_free(ctx);
+    return true;
+}
+
+json get_backend_devices_info() {
     return backend_devices_info();
+}
+
+// ggml only prints its fatal assertion message to stderr, which logcat does not capture, so an
+// Android crash report would carry just a SIGABRT backtrace. Forward the message to the platform
+// log (and to the tombstone) before the process aborts.
+static void lm_ggml_abort_log_callback(const char *message) {
+    log("ERROR", "lm_ggml_abort", 0, "%s", message);
+#if defined(__ANDROID__)
+    android_set_abort_message(message);
+#else
+    fprintf(stderr, "%s\n", message);
+#endif
+}
+
+void install_lm_ggml_abort_handler() {
+    lm_ggml_set_abort_callback(lm_ggml_abort_log_callback);
 }
 
 static const std::vector<lm_ggml_type> kv_cache_types = {
@@ -151,6 +229,82 @@ std::string tokens_to_str(llama_context *ctx, const std::vector<llama_token>::co
         ret += common_token_to_piece(ctx, *it);
     }
     return ret;
+}
+
+bool model_uses_mrope(const llama_model *model) {
+    if (model == nullptr) {
+        return false;
+    }
+    const enum llama_rope_type rope = llama_model_rope_type(model);
+    return rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE;
+}
+
+static std::string state_meta_path(const std::string &state_path) {
+    return state_path + ".meta";
+}
+
+void write_state_meta(const std::string &state_path, const std::vector<std::string> &bitmap_hashes) {
+    const std::string meta_path = state_meta_path(state_path);
+    if (bitmap_hashes.empty()) {
+        std::remove(meta_path.c_str());
+        return;
+    }
+    // Write-through-temp + rename so an interrupted write can never leave a
+    // stale sidecar describing a different state file
+    const std::string tmp_path = meta_path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out.is_open()) {
+            LOG_WARNING("Failed to write state metadata: %s", tmp_path.c_str());
+            std::remove(meta_path.c_str()); // fail closed: no metadata beats wrong metadata
+            return;
+        }
+        out << "rnllama-state-meta v1\n" << bitmap_hashes.size() << "\n";
+        for (const auto &hash : bitmap_hashes) {
+            out << hash << "\n";
+        }
+        out.flush();
+        if (!out.good()) {
+            LOG_WARNING("Failed to write state metadata: %s", tmp_path.c_str());
+            out.close();
+            std::remove(tmp_path.c_str());
+            std::remove(meta_path.c_str());
+            return;
+        }
+    }
+    if (std::rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
+        LOG_WARNING("Failed to replace state metadata: %s", meta_path.c_str());
+        std::remove(tmp_path.c_str());
+        std::remove(meta_path.c_str());
+    }
+}
+
+std::vector<std::string> read_state_meta(const std::string &state_path) {
+    std::vector<std::string> hashes;
+    std::ifstream in(state_meta_path(state_path));
+    if (!in.is_open()) {
+        return hashes;
+    }
+    std::string line;
+    if (!std::getline(in, line) || line != "rnllama-state-meta v1") {
+        return hashes;
+    }
+    size_t count = 0;
+    if (!std::getline(in, line)) {
+        return hashes;
+    }
+    try {
+        count = std::stoul(line);
+    } catch (const std::exception &) {
+        return hashes;
+    }
+    for (size_t i = 0; i < count && std::getline(in, line); i++) {
+        hashes.push_back(line);
+    }
+    if (hashes.size() != count) {
+        hashes.clear(); // truncated sidecar - treat as absent
+    }
+    return hashes;
 }
 
 // Well-formed UTF-8 lead bytes and the range of their first continuation
@@ -394,6 +548,13 @@ bool llama_rn_context::loadModel(common_params &params_)
     draft_model.reset();
     params = params_;
 
+    // common_init_from_params() now creates its threadpools directly, so CPU
+    // defaults must be resolved just as the upstream CLI parser resolves them.
+    // In particular, n_threads_batch=-1 means "inherit n_threads"; passing -1
+    // to lm_ggml_threadpool_new underflows its worker count.
+    postprocess_cpu_params(params.cpuparams);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+
     // Ensure n_parallel is set to a reasonable default for parallel decoding support
     // This sets n_seq_max in the context, which cannot be changed later
     if (params.n_parallel < 1) {
@@ -418,8 +579,12 @@ bool llama_rn_context::loadModel(common_params &params_)
         return false;
     }
 
+    // Load the draft model for embedded MTP drafts and for classic standalone draft models
+    // (draft-simple) alike. Gating this on MTP alone silently disabled speculation for
+    // draft-simple pairs: the app reported draft_tokens = 0 with no error at all.
     if (params.speculative.has_dft() &&
-        has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        (has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+         has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE))) {
         const auto & draft_params = params.speculative.draft;
         common_params params_dft = params;
         params_dft.devices = draft_params.devices;
@@ -435,10 +600,10 @@ bool llama_rn_context::loadModel(common_params &params_)
         }
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
-        LOG_INFO("Loading MTP draft model: %s", params_dft.model.path.c_str());
+        LOG_INFO("Loading draft model: %s", params_dft.model.path.c_str());
         draft_model.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
         if (draft_model == nullptr) {
-            LOG_ERROR("unable to load MTP draft model: %s", params_dft.model.path.c_str());
+            LOG_ERROR("unable to load draft model: %s", params_dft.model.path.c_str());
             return false;
         }
     }
@@ -472,6 +637,16 @@ bool llama_rn_context::loadModel(common_params &params_)
     // limits.
     llama_set_abort_callback(ctx, llama_rn_context_completion::abortCallback, completion);
 
+    try {
+        decision.init(model);
+    } catch (const std::exception & e) {
+        // the model stays usable for anything else, decide() reports that it cannot answer
+        LOG_ERROR("failed to init decision model: %s", e.what());
+        decision.type   = COMMON_DECISION_TYPE_UNKNOWN;
+        decision.legacy = false;
+        decision.error  = e.what();
+    }
+
     // Initialize context shift flag
     LOG_INFO("ctx_shift: %s", params.ctx_shift ? "enabled" : "disabled");
 
@@ -479,6 +654,61 @@ bool llama_rn_context::loadModel(common_params &params_)
     // LOG_INFO("%s\n", common_params_get_system_info(params).c_str());
 
     return true;
+}
+
+bool llama_rn_context::canGenerateText() const {
+    return decision.can_generate_text();
+}
+
+std::string llama_rn_context::modelName() const {
+    char buf[256];
+    if (llama_model_meta_val_str(model, "general.name", buf, sizeof(buf)) > 0) {
+        return buf;
+    }
+    const std::string & path = params.model.path;
+    return path.substr(path.find_last_of("/\\") + 1);
+}
+
+mtmd_context * llama_rn_context::decisionMtmdContext() const {
+    return isMultimodalEnabled() ? mtmd_wrapper->mtmd_ctx : nullptr;
+}
+
+json llama_rn_context::decide(const json & body) {
+    if (!decision.is_decision_model()) {
+        throw std::runtime_error("This model is not a decision model");
+    }
+    if (parallel_mode_enabled) {
+        // clearing the memory would drop the sequences of the slots
+        throw std::runtime_error("Parallel mode is enabled, use parallel.decide()");
+    }
+    const auto request = decision.parse_request(to_common_json(body));
+    decision.check_context(ctx);
+    mtmd_context * mctx = decisionMtmdContext();
+    const auto prompts = decision.fill_prompts(request, mctx);
+
+    // the prompts take over the completion's sequence
+    llama_memory_t mem = llama_get_memory(ctx);
+    auto reset = [&]() {
+        clearCache(true);
+        if (completion != nullptr) {
+            completion->rewind();
+        }
+    };
+    reset();
+
+    std::vector<std::vector<float>> scores;
+    llama_rn_decision_cache cache;
+    try {
+        for (const auto & prompt : prompts) {
+            scores.push_back(llama_rn_decision_eval(ctx, 0, prompt, cache, mctx));
+        }
+    } catch (...) {
+        reset();
+        throw;
+    }
+    reset();
+
+    return from_common_json(decision.format_result(request, prompts, scores, modelName()));
 }
 
 bool llama_rn_context::hasDraftModel() const {
@@ -496,11 +726,18 @@ llama_context * llama_rn_context::createMTPDraftContext(const common_params &par
     }
 
     auto cparams = common_context_params_to_llama(params_for_context);
-    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    cparams.n_rs_seq = 0;
+
+    // An embedded MTP draft lives on an MTP-type context tied to the target context
+    // (ctx_other) and uses rollback sequences; a classic standalone draft model
+    // (draft-simple) needs a regular, independent context with its own KV cache.
+    const bool is_mtp = has_speculative_type(params_for_context.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    cparams.ctx_type = is_mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+    if (is_mtp) {
+        cparams.n_rs_seq = 0;
+        cparams.ctx_other = ctx;
+    }
     cparams.type_k = params_for_context.speculative.draft.cache_type_k;
     cparams.type_v = params_for_context.speculative.draft.cache_type_v;
-    cparams.ctx_other = ctx;
 
     return llama_init_from_model(model_dft, cparams);
 }
@@ -530,10 +767,10 @@ common_chat_params llama_rn_context::getFormattedChatWithJinja(
 ) const {
     common_chat_templates_inputs inputs;
     inputs.use_jinja = true;
-    inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages));
+    inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(messages));
     auto useTools = !tools.empty();
     if (useTools) {
-        inputs.tools = common_chat_tools_parse_oaicompat(json::parse(tools));
+        inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(tools));
     }
     inputs.parallel_tool_calls = parallel_tool_calls;
     if (!tool_choice.empty()) {
@@ -575,15 +812,15 @@ std::string llama_rn_context::getFormattedChat(
   const std::string &chat_template
 ) const {
     common_chat_templates_inputs inputs;
-    inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages));
+    inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(messages));
     inputs.use_jinja = false;
 
     // If chat_template is provided, create new one and use it (probably slow)
     if (!chat_template.empty()) {
         auto tmps = common_chat_templates_init(model, chat_template);
-        return common_chat_templates_apply(tmps.get(), inputs).prompt;
+        return common_chat_templates_apply(tmps.get(), inputs).prompt.str();
     } else {
-        return common_chat_templates_apply(templates.get(), inputs).prompt;
+        return common_chat_templates_apply(templates.get(), inputs).prompt.str();
     }
 }
 
@@ -686,9 +923,22 @@ void llama_rn_context::releaseMultimodal() {
     }
 }
 
-bool llama_rn_context::initVocoder(const std::string &vocoder_model_path, int batch_size) {
+std::vector<std::string> llama_rn_context::getMediaHashes() const {
+    if (mtmd_wrapper == nullptr) {
+        return {};
+    }
+    return mtmd_wrapper->bitmap_past_hashes;
+}
+
+void llama_rn_context::setMediaHashes(const std::vector<std::string> &hashes) {
+    if (mtmd_wrapper != nullptr) {
+        mtmd_wrapper->bitmap_past_hashes = hashes;
+    }
+}
+
+bool llama_rn_context::initVocoder(const std::string &vocoder_model_path, int batch_size, bool use_gpu) {
     try {
-        tts_wrapper = new llama_rn_context_tts(vocoder_model_path, batch_size);
+        tts_wrapper = new llama_rn_context_tts(vocoder_model_path, batch_size, use_gpu);
         has_vocoder = true;
         return true;
     } catch (const std::exception& e) {
@@ -794,9 +1044,15 @@ void llama_rn_context::clearCache(bool clear_data) {
 
     llama_memory_clear(kv, clear_data);
 
+    // the media the completion evaluated is gone with the memory
+    if (mtmd_wrapper != nullptr) {
+        mtmd_wrapper->bitmap_past_hashes.clear();
+    }
+
     if (completion != nullptr) {
         completion->embd.clear();
         completion->n_past = 0;
+        completion->clearStateCheckpoints();
         LOG_INFO("Cache cleared and completion state reset (clear_data=%s)", clear_data ? "true" : "false");
     } else {
         LOG_INFO("Cache cleared (clear_data=%s)", clear_data ? "true" : "false");

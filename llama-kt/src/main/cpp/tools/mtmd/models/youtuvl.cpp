@@ -69,14 +69,7 @@ lm_ggml_cgraph * clip_graph_youtuvl::build() {
         lm_ggml_set_name(inv_window_idx, "inv_window_idx");
         lm_ggml_set_input(inv_window_idx);
         // mask for window attention
-        window_mask = lm_ggml_new_tensor_2d(ctx0, LM_GGML_TYPE_F32, n_pos, n_pos);
-        lm_ggml_set_name(window_mask, "window_mask");
-        lm_ggml_set_input(window_mask);
-
-        // if flash attn is used, we need to pad the mask and cast to f16
-        if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
-            window_mask = lm_ggml_cast(ctx0, window_mask, LM_GGML_TYPE_F16);
-        }
+        window_mask = build_inp_attn_mask(n_pos, n_pos);
 
         // inpL shape: [n_embd, n_patches_x * n_patches_y, batch_size]
         LM_GGML_ASSERT(batch_size == 1);

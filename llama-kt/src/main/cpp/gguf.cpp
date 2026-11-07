@@ -9,10 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <map>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #define LM_GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
@@ -237,6 +239,7 @@ struct lm_gguf_reader {
         : callback(callback),
           userdata(userdata),
           max_chunk_read(max_chunk_read),
+          start_offset(data_offset),
           data_offset(data_offset),
           nbytes_remain(nbytes_remain) {
         LM_GGML_ASSERT(max_chunk_read > 0);
@@ -365,6 +368,11 @@ struct lm_gguf_reader {
         return data_offset;
     }
 
+    // position in the file where the GGUF data starts, alignment is relative to it, not to the file
+    uint64_t start() const {
+        return start_offset;
+    }
+
     bool seek(uint64_t absolute_offset) const {
         const uint64_t end_offset = uint64_t(data_offset) + nbytes_remain;
         if (absolute_offset > end_offset) {
@@ -414,6 +422,7 @@ private:
     lm_gguf_reader_callback_t callback = nullptr;
     void * userdata = nullptr;
     size_t max_chunk_read = 0;
+    uint64_t start_offset = 0;
     mutable uint64_t data_offset = 0;
     mutable uint64_t nbytes_remain = 0;
 };
@@ -542,6 +551,8 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
 
     // KV pairs
     {
+        std::unordered_set<std::string> seen_keys;
+
         for (int64_t i = 0; ok && i < n_kv; ++i) {
             std::string key;
             lm_gguf_type   type     = lm_gguf_type(-1);
@@ -561,11 +572,9 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
                 LM_GGML_LOG_ERROR("%s: key %" PRIi64 " is empty\n", __func__, i);
                 ok = false;
             }
-            for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
-                if (key == ctx->kv[j].key) {
-                    LM_GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
-                    ok = false;
-                }
+            if (ok && !seen_keys.insert(key).second) {
+                LM_GGML_LOG_ERROR("%s: duplicate key '%s' for KV pair %" PRIi64 "\n", __func__, key.c_str(), i);
+                ok = false;
             }
             if (!ok) {
                 break;
@@ -611,6 +620,13 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
         LM_GGML_ASSERT(int64_t(ctx->kv.size()) == n_kv);
 
         const int alignment_idx = lm_gguf_find_key(ctx, LM_GGUF_KEY_GENERAL_ALIGNMENT);
+        if (alignment_idx != -1 && lm_gguf_get_kv_type(ctx, alignment_idx) != LM_GGUF_TYPE_UINT32) {
+            LM_GGML_LOG_ERROR("%s: key '%s' must be of type %s but is %s\n",
+                __func__, LM_GGUF_KEY_GENERAL_ALIGNMENT, lm_gguf_type_name(LM_GGUF_TYPE_UINT32),
+                lm_gguf_type_name(lm_gguf_get_kv_type(ctx, alignment_idx)));
+            lm_gguf_free(ctx);
+            return nullptr;
+        }
         ctx->alignment = alignment_idx == -1 ? LM_GGUF_DEFAULT_ALIGNMENT : lm_gguf_get_val_u32(ctx, alignment_idx);
 
         if (ctx->alignment == 0 || (ctx->alignment & (ctx->alignment - 1)) != 0) {
@@ -621,6 +637,8 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
     }
 
     // read the tensor info
+    std::unordered_set<std::string> seen_tensor_names;
+
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
         struct lm_gguf_tensor_info info;
 
@@ -644,12 +662,10 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
             lm_ggml_set_name(&info.t, name.c_str());
 
             // make sure there are no duplicate tensor names
-            for (int64_t j = 0; ok && j < i; ++j) {
-                if (strcmp(info.t.name, ctx->info[j].t.name) == 0) {
-                    LM_GGML_LOG_ERROR("%s: duplicate tensor name '%s' for tensors %" PRIi64 " and %" PRIi64 "\n", __func__, info.t.name, j, i);
-                    ok = false;
-                    break;
-                }
+            if (ok && !seen_tensor_names.insert(name).second) {
+                LM_GGML_LOG_ERROR("%s: duplicate tensor name '%s' for tensor %" PRIi64 "\n", __func__, info.t.name, i);
+                ok = false;
+                break;
             }
         }
         if (!ok) {
@@ -682,15 +698,24 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
             }
 
             // check that the total number of elements is representable
-            if (ok && ((INT64_MAX/info.t.ne[1] <= info.t.ne[0]) ||
-                       (INT64_MAX/info.t.ne[2] <= info.t.ne[0]*info.t.ne[1]) ||
-                       (INT64_MAX/info.t.ne[3] <= info.t.ne[0]*info.t.ne[1]*info.t.ne[2]))) {
-
-                LM_GGML_LOG_ERROR("%s: total number of elements in tensor '%s' with shape "
-                    "(%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") is >= %" PRIi64 "\n",
-                    __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], INT64_MAX);
-                ok = false;
-                break;
+            // (a zero-element tensor is trivially representable)
+            if (ok) {
+                int64_t current_nelements = info.t.ne[0];
+                for (int i = 1; i < LM_GGML_MAX_DIMS; ++i) {
+                    if (info.t.ne[i] > 1) { // 1 or 0 won't cause an overflow
+                        if (INT64_MAX / info.t.ne[i] < current_nelements) {
+                             ok = false;
+                             break;
+                         }
+                     }
+                     current_nelements *= info.t.ne[i];
+                 }
+                 if (!ok) {
+                     LM_GGML_LOG_ERROR("%s: incorrect shape for a tensor '%s' may cause overflow errors: "
+                         "(%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") is >= INT64_MAX (%" PRIi64 ")\n",
+                         __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], INT64_MAX);
+                     break;
+                 }
             }
         }
         if (!ok) {
@@ -753,7 +778,7 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
     LM_GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
-    if (n_tensors > 0 && !gr.seek(LM_GGML_PAD(gr.tell(), ctx->alignment))) {
+    if (n_tensors > 0 && !gr.seek(gr.start() + LM_GGML_PAD(gr.tell() - gr.start(), ctx->alignment))) {
         LM_GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         lm_gguf_free(ctx);
         return nullptr;
@@ -774,7 +799,16 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
                 lm_gguf_free(ctx);
                 return nullptr;
             }
-            size_t padded_size = LM_GGML_PAD(lm_ggml_nbytes(&ti.t), ctx->alignment);
+            const size_t nbytes = lm_ggml_nbytes(&ti.t);
+            // LM_GGML_PAD adds (alignment - 1) to nbytes. when nbytes is near
+            // SIZE_MAX this wraps to 0 and makes the check below dead.
+            if (nbytes > SIZE_MAX - (ctx->alignment - 1)) {
+                LM_GGML_LOG_ERROR("%s: tensor '%s' size %zu overflows after padding (alignment %zu)\n",
+                    __func__, ti.t.name, nbytes, ctx->alignment);
+                lm_gguf_free(ctx);
+                return nullptr;
+            }
+            const size_t padded_size = LM_GGML_PAD(nbytes, ctx->alignment);
             if (SIZE_MAX - ctx->size < padded_size) {
                 LM_GGML_LOG_ERROR("%s: tensor '%s' size overflow, cannot accumulate size %zu + %zu\n",
                     __func__, ti.t.name, ctx->size, padded_size);
@@ -1186,6 +1220,11 @@ const char * lm_gguf_get_tensor_name(const struct lm_gguf_context * ctx, int64_t
     return ctx->info[tensor_id].t.name;
 }
 
+const int64_t * lm_gguf_get_tensor_ne(const struct lm_gguf_context * ctx, int64_t tensor_id) {
+    LM_GGML_ASSERT(tensor_id >= 0 && tensor_id < lm_gguf_get_n_tensors(ctx));
+    return ctx->info[tensor_id].t.ne;
+}
+
 enum lm_ggml_type lm_gguf_get_tensor_type(const struct lm_gguf_context * ctx, int64_t tensor_id) {
     LM_GGML_ASSERT(tensor_id >= 0 && tensor_id < lm_gguf_get_n_tensors(ctx));
     return ctx->info[tensor_id].t.type;
@@ -1419,7 +1458,7 @@ void lm_gguf_set_tensor_data(struct lm_gguf_context * ctx, const char * name, co
 struct lm_gguf_writer_base {
     size_t written_bytes {0u};
 
-    ~lm_gguf_writer_base(void) = default;
+    virtual ~lm_gguf_writer_base(void) = default;
 
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;

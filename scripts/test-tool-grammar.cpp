@@ -90,9 +90,9 @@ static common_chat_params render(const common_chat_templates * tmpls, bool think
 static common_chat_msg parse(const common_chat_params & p, const std::string & reply) {
     // As rn-completion's parseChatOutput(): the generation prompt, then the reply.
     common_chat_parser_params syntax(p);
-    syntax.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-    syntax.parser.load(p.parser);
-    return common_chat_parse(p.generation_prompt + reply, false, syntax);
+    // Through the string nativeFormatChat() keeps between format and parse.
+    syntax.parser.load(p.parser.save());
+    return common_chat_parse(common_chat_input(p.generation_prompt + reply), false, syntax);
 }
 
 int main(int argc, char ** argv) {
@@ -119,7 +119,7 @@ int main(int argc, char ** argv) {
         // The reasoning tags the reasoning sampler arms on.
         CHECK(p.supports_thinking);
         CHECK(p.thinking_start_tag == "<think>");
-        CHECK(p.thinking_end_tag == "</think>");
+        CHECK(!p.thinking_end_tags.empty() && p.thinking_end_tags.front() == "</think>");
 
         // Installed as nativeCompletion() does it.
         common_params_sampling sp;

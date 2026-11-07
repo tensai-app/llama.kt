@@ -1,10 +1,8 @@
 #include "models.h"
 
 void llama_model_gemma3n::load_arch_hparams(llama_model_loader & ml) {
-    uint32_t swa_period = 5;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    hparams.set_swa_pattern(swa_period);
+    load_swa_pattern(ml, 5);
 
     hparams.n_layer_kv_from_start = 20;
     hparams.f_attention_scale     = 1.0f;
@@ -82,7 +80,7 @@ std::unique_ptr<llm_graph_context> llama_model_gemma3n::build_arch_graph(const l
 }
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
-static lm_ggml_tensor * lm_ggml_view_2d_slice(lm_ggml_context * ctx0, lm_ggml_tensor * x, int idx) {
+static lm_ggml_tensor * gemma3n_view_2d_slice(lm_ggml_context * ctx0, lm_ggml_tensor * x, int idx) {
     LM_GGML_ASSERT(idx < (int) x->ne[2]);
     return lm_ggml_view_2d(ctx0, x, x->ne[0], x->ne[1], lm_ggml_row_size(x->type, x->ne[0]),
                         idx * x->ne[0] * x->ne[1] * lm_ggml_element_size(x));
@@ -98,10 +96,8 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
     lm_ggml_tensor * cur;
     lm_ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
-
     // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
-    inpL = lm_ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+    inpL = build_inp_embd(model.tok_embd, sqrtf(n_embd));
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -139,7 +135,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         lm_ggml_tensor * predictions = altup_predict(cur, il);  // [n_embd, n_tokens, n_altup]
 
         // predicted value will go through self-attention and laurel
-        lm_ggml_tensor * active_prediction = lm_ggml_view_2d_slice(ctx0, predictions, i_altup_act);  // [n_embd, n_tokens]
+        lm_ggml_tensor * active_prediction = gemma3n_view_2d_slice(ctx0, predictions, i_altup_act);  // [n_embd, n_tokens]
         cur = active_prediction;
         cb(cur, "active_prediction", il);
 
@@ -176,7 +172,14 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
-            lm_ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+            lm_ggml_tensor * Qcur;
+            if (model.layers[il].wqkv) {
+                lm_ggml_tensor * qkv = build_lora_mm(model.layers[il].wqkv, cur);
+                const int64_t q_dim = n_embd_head * n_head;
+                Qcur = lm_ggml_cont(ctx0, lm_ggml_view_2d(ctx0, qkv, q_dim, n_tokens, qkv->nb[1], 0));
+            } else {
+                Qcur = build_lora_mm(model.layers[il].wq, cur);
+            }
             cb(Qcur, "Qcur", il);
             Qcur = lm_ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
@@ -229,13 +232,13 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
 
         lm_ggml_tensor * first_prediction;                                                   // [n_embd, n_tokens]
         {
-            first_prediction = lm_ggml_view_2d_slice(ctx0, corrected, i_altup_act);          // [n_embd, n_tokens]
+            first_prediction = gemma3n_view_2d_slice(ctx0, corrected, i_altup_act);       // [n_embd, n_tokens]
             first_prediction = lm_ggml_mul(ctx0, first_prediction, model.layers[il].altup_correct_scale);
             first_prediction = build_lora_mm(model.layers[il].per_layer_inp_gate, first_prediction);
             first_prediction = lm_ggml_gelu(ctx0, first_prediction);                 // [n_embd_altup, n_tokens]
             cb(first_prediction, "first_prediction_gated", il);
 
-            lm_ggml_tensor * inp_this_layer = lm_ggml_view_2d_slice(ctx0, inp_per_layer, il);   // [n_embd_altup, n_tokens]
+            lm_ggml_tensor * inp_this_layer = gemma3n_view_2d_slice(ctx0, inp_per_layer, il);   // [n_embd_altup, n_tokens]
             first_prediction = lm_ggml_mul(ctx0, first_prediction, inp_this_layer);  // [n_embd_altup, n_tokens]
             cb(first_prediction, "first_prediction_scaled", il);
 
@@ -246,7 +249,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         }
         // equivalent to python code: corrected_predictions[1:] += first_prediction
         {
-            lm_ggml_tensor * slice_first = lm_ggml_view_2d_slice(ctx0, corrected, 0);
+            lm_ggml_tensor * slice_first = gemma3n_view_2d_slice(ctx0, corrected, 0);
             lm_ggml_tensor * slice_rest  = lm_ggml_view_3d(
                 ctx0, corrected, n_embd, n_tokens, n_altup - 1, lm_ggml_row_size(corrected->type, n_embd),
                 lm_ggml_row_size(corrected->type, n_embd * n_tokens), n_embd * n_tokens * lm_ggml_element_size(corrected));
@@ -264,7 +267,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
 
     // cur now has multiple altup(s), we want to merge them back to 1 altup
     {
-        lm_ggml_tensor * target_magnitude = calc_magnitude(lm_ggml_view_2d_slice(ctx0, cur, i_altup_act));  // [n_embd, n_tokens]
+        lm_ggml_tensor * target_magnitude = calc_magnitude(gemma3n_view_2d_slice(ctx0, cur, i_altup_act));  // [n_embd, n_tokens]
         // do a view to skip the first slice (active altup)
         lm_ggml_tensor * alt_slice =
             lm_ggml_view_3d(ctx0, cur, n_embd, n_tokens, n_altup - 1, lm_ggml_row_size(cur->type, n_embd),
@@ -276,9 +279,9 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         cb(altup_unembd, "altup_unembd", -1);
 
         // equivalent to torch.mean(hidden_states, dim=0)
-        cur = lm_ggml_view_2d_slice(ctx0, cur, 0);  // [n_embd, n_tokens]
+        cur = gemma3n_view_2d_slice(ctx0, cur, 0);  // [n_embd, n_tokens]
         for (int i = 0; i < n_altup - 1; ++i) {
-            cur = lm_ggml_add(ctx0, cur, lm_ggml_view_2d_slice(ctx0, altup_unembd, i));
+            cur = lm_ggml_add(ctx0, cur, gemma3n_view_2d_slice(ctx0, altup_unembd, i));
         }
         cur = lm_ggml_scale(ctx0, cur, 1.0f / float(n_altup));  // [n_embd, n_tokens]
         cb(cur, "unembd_merged", -1);
@@ -306,8 +309,6 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    lm_ggml_build_forward_expand(gf, cur);
 }
 
 lm_ggml_tensor * llama_model_gemma3n::graph::calc_magnitude(lm_ggml_tensor * x) {
@@ -320,6 +321,7 @@ lm_ggml_tensor * llama_model_gemma3n::graph::build_inp_per_layer() {
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
     lm_ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_altup);
+    // mixed ubatch: embd rows have token id 0, same padding row as below
     if (ubatch.token) {
         inp->tokens = lm_ggml_new_tensor_1d(ctx0, LM_GGML_TYPE_I32, ubatch.n_tokens);
         lm_ggml_set_input(inp->tokens);
@@ -412,7 +414,7 @@ lm_ggml_tensor * llama_model_gemma3n::graph::altup_compute_router_modalities(lm_
 // input cur shape: [n_embd, n_tokens, n_altup]
 // output    shape: [n_embd, n_tokens, n_altup]
 lm_ggml_tensor * llama_model_gemma3n::graph::altup_predict(lm_ggml_tensor * cur, int il) {
-    lm_ggml_tensor * activated  = lm_ggml_view_2d_slice(ctx0, cur, i_altup_act);      // [n_embd, n_tokens]
+    lm_ggml_tensor * activated  = gemma3n_view_2d_slice(ctx0, cur, i_altup_act);   // [n_embd, n_tokens]
     lm_ggml_tensor * modalities = altup_compute_router_modalities(activated, il);  // [n_altup, n_tokens]
     cb(modalities, "modalities", il);
 
@@ -440,7 +442,7 @@ lm_ggml_tensor * llama_model_gemma3n::graph::altup_correct(lm_ggml_tensor * pred
     lm_ggml_tensor * modalities = altup_compute_router_modalities(activated, il);  // [n_altup, n_tokens]
     cb(modalities, "modalities", il);
 
-    lm_ggml_tensor * active_prediction = lm_ggml_view_2d_slice(ctx0, predictions, i_altup_act);
+    lm_ggml_tensor * active_prediction = gemma3n_view_2d_slice(ctx0, predictions, i_altup_act);
     lm_ggml_tensor * innovation        = lm_ggml_sub(ctx0, activated, active_prediction);  // [n_embd, n_tokens]
     cb(innovation, "innovation", il);
 

@@ -160,6 +160,18 @@ static float lm_ggml_get_op_params_f32(const struct lm_ggml_tensor * tensor, uin
     return ((const float *)(tensor->op_params))[i];
 }
 
+// [TAG_LM_GGML_PREC]
+// - LM_GGML_OP_MUL_MAT
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
+//
+// - LM_GGML_OP_MUL_MAT_ID
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
 static void lm_ggml_set_op_params_i32(struct lm_ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < LM_GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;

@@ -20,6 +20,7 @@ class llama_memory_hybrid_iswa : public llama_memory_i {
 public:
     llama_memory_hybrid_iswa(
         const llama_model & model,
+                      bool   no_alloc,
                             /* attn */
                 lm_ggml_type   type_k,
                 lm_ggml_type   type_v,
@@ -27,7 +28,6 @@ public:
                      bool   swa_full,
                  uint32_t   kv_size,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
                             /* recurrent */
                 lm_ggml_type   type_r,
                 lm_ggml_type   type_s,

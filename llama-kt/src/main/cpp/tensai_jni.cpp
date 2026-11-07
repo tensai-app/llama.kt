@@ -339,8 +339,10 @@ struct chat_parse_state {
     // reasoning, or when thinking was turned off for this prompt. Kept here
     // for the same reason as everything else in this struct: the template is
     // applied in nativeFormatChat() and they are needed in nativeCompletion().
-    std::string             thinking_start_tag;
-    std::string             thinking_end_tag;
+    // Several end tags since llama.cpp b11960 (a template can close the block more than one
+    // way); the first is the one a budget forces.
+    std::string              thinking_start_tag;
+    std::vector<std::string> thinking_end_tags;
     // The prompt this state describes. nativeCompletion() is free to be called
     // with any string (see the raw `decode()` path in LlamaEngineFlow), so the
     // state is only trusted when the prompt matches the one it came from —
@@ -1421,7 +1423,7 @@ static jint completion_impl(
         // and common_sampler_init() skips the sampler outright without a start
         // sequence to arm on.
         if (chat_state_applies && !chat_state.thinking_start_tag.empty()
-                               && !chat_state.thinking_end_tag.empty()) {
+                               && !chat_state.thinking_end_tags.empty()) {
             const llama_vocab* vocab = llama_model_get_vocab(rnctx->model);
             auto& sp = rnctx->params.sampling;
             // -1 when only the lazy grammar asked for the sampler:
@@ -1429,11 +1431,14 @@ static jint completion_impl(
             // unlimited budget, so it tracks the block and never forces it shut.
             sp.reasoning_budget_tokens = static_cast<int32_t>(reasoningBudgetTokens);
             sp.reasoning_budget_start  = common_tokenize(vocab, chat_state.thinking_start_tag, false, true);
-            sp.reasoning_budget_end    = common_tokenize(vocab, chat_state.thinking_end_tag, false, true);
+            sp.reasoning_budget_end.clear();
+            for (const auto& tag : chat_state.thinking_end_tags) {
+                sp.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
+            }
             // No budget message prepended to the forced sequence: any text
             // injected here would land in the reasoning the user reads,
             // attributed to a model that never wrote it.
-            sp.reasoning_budget_forced = sp.reasoning_budget_end;
+            sp.reasoning_budget_forced = sp.reasoning_budget_end.front();
             // The assistant prefix the template already appended to the prompt.
             // common_sampler_init() replays it through the sampler, so a
             // template that opens the reasoning block itself (the prefix ends
@@ -1442,10 +1447,11 @@ static jint completion_impl(
             // REASONING_BUDGET_COUNTING initial state exists for, reached here
             // by the general route instead of by guessing per model.
             sp.generation_prompt = chat_state.generation_prompt;
-            LOGI("nativeCompletion: reasoning budget=%d tokens, start='%s' (%zu tok), end='%s' (%zu tok)",
+            LOGI("nativeCompletion: reasoning budget=%d tokens, start='%s' (%zu tok), end='%s' (%zu tok, %zu end tags)",
                  sp.reasoning_budget_tokens,
                  chat_state.thinking_start_tag.c_str(), sp.reasoning_budget_start.size(),
-                 chat_state.thinking_end_tag.c_str(),   sp.reasoning_budget_end.size());
+                 chat_state.thinking_end_tags.front().c_str(), sp.reasoning_budget_forced.size(),
+                 chat_state.thinking_end_tags.size());
         } else if (reasoningBudgetTokens >= 0) {
             LOGI("nativeCompletion: reasoning budget=%d ignored, this prompt has no reasoning delimiters",
                  (int) reasoningBudgetTokens);
@@ -2065,7 +2071,9 @@ static jstring formatChat_impl(
             /* chat_template_kwargs */ {},
             /* force_pure_content*/ false
         );
-        formatted = params.prompt;
+        // The flat string, as rn-llama's own formatter does: the user-input parts of the
+        // prompt are tokenized with special tokens parsed, as before b11960.
+        formatted = params.prompt.str();
 
         chat_parse_state state;
         state.parsable          = true;
@@ -2074,16 +2082,17 @@ static jstring formatChat_impl(
         state.format           = static_cast<int>(params.format);
         state.reasoning_format  = COMMON_REASONING_FORMAT_AUTO;
         state.generation_prompt = params.generation_prompt;
-        state.parser            = params.parser;
+        state.parser            = params.parser.save();
         state.tool_grammar      = {params.grammar, params.grammar_lazy, params.grammar_triggers};
         // TEN-85: only meaningful when the template actually reasons — the
         // tags are left over from a previous variant otherwise, and a budget
         // built on them would arm against markers this prompt can't produce.
         if (params.supports_thinking) {
             state.thinking_start_tag = params.thinking_start_tag;
-            state.thinking_end_tag   = params.thinking_end_tag;
+            state.thinking_end_tags  = params.thinking_end_tags;
         }
         // state.prompt is filled in below, from the round-tripped string.
+        const size_t state_parser_size = state.parser.size();
         chat_state_put(rnctx, std::move(state));
 
         // Own try: common_chat_format_name() throws on a format it doesn't
@@ -2094,8 +2103,9 @@ static jstring formatChat_impl(
             format_name = common_chat_format_name(params.format);
         } catch (const std::exception&) { /* keep "unknown" */ }
         LOGI("nativeFormatChat: chat format=%s, parser=%zu bytes, generation_prompt=%zu chars, thinking=%d start='%s' end='%s'",
-             format_name, params.parser.size(), params.generation_prompt.size(),
-             params.supports_thinking, params.thinking_start_tag.c_str(), params.thinking_end_tag.c_str());
+             format_name, state_parser_size, params.generation_prompt.size(),
+             params.supports_thinking, params.thinking_start_tag.c_str(),
+             params.thinking_end_tags.empty() ? "" : params.thinking_end_tags.front().c_str());
     } catch (const std::exception& e) {
         // Some templates fail under jinja — fall back to the legacy path
         // (no thinking control there).
@@ -2485,7 +2495,8 @@ static jint loadSession_impl(
     if (n_read == 0) {
         // The seq load returns 0 on every failure: wrong magic/version (this
         // is how old llama_state_save_file files, GGSN, are refused: only
-        // GGSQ v2 passes), a truncated file (llama_file throws, caught inside
+        // GGSQ v4 passes, so GGSQ v2 files saved before llama.cpp b11960 land
+        // here too), a truncated file (llama_file throws, caught inside
         // the API), token count over capacity, n_stream mismatch, bad cell
         // data. Where it fails matters for what is left in the cache:
         //   - before state_read_meta (header checks, n_stream mismatch): the

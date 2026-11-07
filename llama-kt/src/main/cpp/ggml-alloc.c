@@ -40,6 +40,7 @@ bool lm_ggml_op_can_inplace(enum lm_ggml_op op) {
         case LM_GGML_OP_SILU_BACK:
         case LM_GGML_OP_RMS_NORM:
         case LM_GGML_OP_RMS_NORM_BACK:
+        case LM_GGML_OP_CLAMP:
         case LM_GGML_OP_SOFT_MAX:
         case LM_GGML_OP_SOFT_MAX_BACK:
             return true;
@@ -1116,131 +1117,55 @@ size_t lm_ggml_gallocr_get_buffer_size(lm_ggml_gallocr_t galloc, int buffer_id) 
 
 // utils
 
-static void free_buffers(lm_ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {
-    for (size_t i = 0; i < *n_buffers; i++) {
-        lm_ggml_backend_buffer_free((*buffers)[i]);
+static struct lm_ggml_tensor ** lm_ggml_backend_alloc_ctx_tensors_from_buft_collect(
+        struct lm_ggml_context * ctx, int * n_tensors) {
+    int n = 0;
+    for (struct lm_ggml_tensor * t = lm_ggml_get_first_tensor(ctx); t != NULL; t = lm_ggml_get_next_tensor(ctx, t)) {
+        n++;
     }
-    free(*buffers);
+    *n_tensors = n;
+    if (n == 0) {
+        return NULL;
+    }
+
+    struct lm_ggml_tensor ** tensors = (struct lm_ggml_tensor **) malloc(n * sizeof(struct lm_ggml_tensor *));
+    if (tensors == NULL) {
+        LM_GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, n * sizeof(struct lm_ggml_tensor *));
+        return NULL;
+    }
+    int i = 0;
+    for (struct lm_ggml_tensor * t = lm_ggml_get_first_tensor(ctx); t != NULL; t = lm_ggml_get_next_tensor(ctx, t)) {
+        tensors[i++] = t;
+    }
+    return tensors;
 }
 
-static bool alloc_tensor_range(struct lm_ggml_context * ctx,
-        struct lm_ggml_tensor * first, struct lm_ggml_tensor * last,
-        lm_ggml_backend_buffer_type_t buft, size_t size,
-        lm_ggml_backend_buffer_t ** buffers, size_t * n_buffers) {
-
-    lm_ggml_backend_buffer_t buffer = lm_ggml_backend_buft_alloc_buffer(buft, size);
-    if (buffer == NULL) {
-        LM_GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, lm_ggml_backend_buft_name(buft), size);
-        free_buffers(buffers, n_buffers);
-        return false;
-    }
-
-    *buffers = realloc(*buffers, sizeof(lm_ggml_backend_buffer_t) * (*n_buffers + 1));
-    (*buffers)[(*n_buffers)++] = buffer;
-
-    struct lm_ggml_tallocr tallocr = lm_ggml_tallocr_new(buffer);
-
-    for (struct lm_ggml_tensor * t = first; t != last; t = lm_ggml_get_next_tensor(ctx, t)) {
-        enum lm_ggml_status status = LM_GGML_STATUS_SUCCESS;
-        if (t->data == NULL) {
-            if (t->view_src == NULL) {
-                status = lm_ggml_tallocr_alloc(&tallocr, t);
-            } else if (t->buffer == NULL) {
-                status = lm_ggml_backend_view_init(t);
-            }
-        } else {
-            if (t->view_src != NULL && t->buffer == NULL) {
-                // view of a pre-allocated tensor
-                status = lm_ggml_backend_view_init(t);
-            }
-        }
-        if (status != LM_GGML_STATUS_SUCCESS) {
-            LM_GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
-            free_buffers(buffers, n_buffers);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static lm_ggml_backend_buffer_t lm_ggml_backend_alloc_ctx_tensors_from_buft_impl(
-        struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft, size_t * nbytes_total, bool no_alloc) {
+lm_ggml_backend_buffer_t lm_ggml_backend_alloc_ctx_tensors_from_buft(struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft) {
     LM_GGML_ASSERT(lm_ggml_get_no_alloc(ctx) == true);
 
-    size_t alignment = lm_ggml_backend_buft_get_alignment(buft);
-    size_t max_size = lm_ggml_backend_buft_get_max_size(buft);
-
-    lm_ggml_backend_buffer_t * buffers = NULL;
-    size_t n_buffers = 0;
-    *nbytes_total = 0;
-
-    size_t cur_buf_size = 0;
-    struct lm_ggml_tensor * first = lm_ggml_get_first_tensor(ctx);
-    for (struct lm_ggml_tensor * t = first; t != NULL; t = lm_ggml_get_next_tensor(ctx, t)) {
-        size_t this_size = 0;
-        if (t->data == NULL && t->view_src == NULL) {
-            this_size = LM_GGML_PAD(lm_ggml_backend_buft_get_alloc_size(buft, t), alignment);
-        }
-
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
-            // allocate tensors in the current buffer
-            if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
-                return NULL;
-            }
-            first = t;
-            *nbytes_total += cur_buf_size;
-            cur_buf_size = this_size;
-        } else {
-            cur_buf_size += this_size;
-        }
-    }
-
-    // allocate remaining tensors
-    if (cur_buf_size > 0) {
-        *nbytes_total += cur_buf_size;
-        if (!no_alloc && !alloc_tensor_range(ctx, first, NULL, buft, cur_buf_size, &buffers, &n_buffers)) {
-            return NULL;
-        }
-    }
-
-    if (no_alloc) {
+    int n_tensors = 0;
+    struct lm_ggml_tensor ** tensors = lm_ggml_backend_alloc_ctx_tensors_from_buft_collect(ctx, &n_tensors);
+    if (tensors == NULL) {
         return NULL;
     }
 
-    if (n_buffers == 0) {
-#ifndef NDEBUG
-        LM_GGML_LOG_DEBUG("%s: all tensors in the context are already allocated\n", __func__);
-#endif
-        LM_GGML_ASSERT(!buffers);
-        return NULL;
-    }
-
-    lm_ggml_backend_buffer_t buffer;
-    if (n_buffers == 1) {
-        buffer = buffers[0];
-    } else {
-        buffer = lm_ggml_backend_multi_buffer_alloc_buffer(buffers, n_buffers);
-    }
-    if (buffers) {
-        free(buffers); // can be NULL if context is empty or no_alloc
-    }
+    lm_ggml_backend_buffer_t buffer = lm_ggml_backend_buft_alloc_buffer_n(buft, tensors, n_tensors);
+    free(tensors);
     return buffer;
 }
 
 size_t lm_ggml_backend_alloc_ctx_tensors_from_buft_size(struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft) {
-    size_t nbytes_total = 0;
-    lm_ggml_backend_buffer_t buf = lm_ggml_backend_alloc_ctx_tensors_from_buft_impl(ctx, buft, &nbytes_total, /*no_alloc=*/ true);
-    LM_GGML_ASSERT(!buf);
-    return nbytes_total;
-}
+    LM_GGML_ASSERT(lm_ggml_get_no_alloc(ctx) == true);
 
-lm_ggml_backend_buffer_t lm_ggml_backend_alloc_ctx_tensors_from_buft(struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft) {
-    size_t nbytes_total = 0;
-    if (lm_ggml_backend_buft_is_meta(buft)) {
-        return lm_ggml_backend_meta_alloc_ctx_tensors_from_buft(ctx, buft);
+    int n_tensors = 0;
+    struct lm_ggml_tensor ** tensors = lm_ggml_backend_alloc_ctx_tensors_from_buft_collect(ctx, &n_tensors);
+    if (tensors == NULL) {
+        return 0;
     }
-    return lm_ggml_backend_alloc_ctx_tensors_from_buft_impl(ctx, buft, &nbytes_total, /*no_alloc =*/ false);
+
+    size_t nbytes_total = lm_ggml_backend_buft_get_alloc_size_n(buft, tensors, n_tensors);
+    free(tensors);
+    return nbytes_total;
 }
 
 lm_ggml_backend_buffer_t lm_ggml_backend_alloc_ctx_tensors(struct lm_ggml_context * ctx, lm_ggml_backend_t backend) {

@@ -34,13 +34,15 @@ extern "C" {
     // Backend buffer type
     //
 
-    LM_GGML_API const char *          lm_ggml_backend_buft_name          (lm_ggml_backend_buffer_type_t buft);
-    LM_GGML_API lm_ggml_backend_buffer_t lm_ggml_backend_buft_alloc_buffer  (lm_ggml_backend_buffer_type_t buft, size_t size);
-    LM_GGML_API size_t                lm_ggml_backend_buft_get_alignment (lm_ggml_backend_buffer_type_t buft);
-    LM_GGML_API size_t                lm_ggml_backend_buft_get_max_size  (lm_ggml_backend_buffer_type_t buft);
-    LM_GGML_API size_t                lm_ggml_backend_buft_get_alloc_size(lm_ggml_backend_buffer_type_t buft, const struct lm_ggml_tensor * tensor);
-    LM_GGML_API bool                  lm_ggml_backend_buft_is_host       (lm_ggml_backend_buffer_type_t buft);
-    LM_GGML_API lm_ggml_backend_dev_t    lm_ggml_backend_buft_get_device    (lm_ggml_backend_buffer_type_t buft);
+    LM_GGML_API const char *          lm_ggml_backend_buft_name            (lm_ggml_backend_buffer_type_t buft);
+    LM_GGML_API lm_ggml_backend_buffer_t lm_ggml_backend_buft_alloc_buffer    (lm_ggml_backend_buffer_type_t buft, size_t size);
+    LM_GGML_API lm_ggml_backend_buffer_t lm_ggml_backend_buft_alloc_buffer_n  (lm_ggml_backend_buffer_type_t buft, struct lm_ggml_tensor ** tensors, int n_tensors);
+    LM_GGML_API size_t                lm_ggml_backend_buft_get_alignment   (lm_ggml_backend_buffer_type_t buft);
+    LM_GGML_API size_t                lm_ggml_backend_buft_get_max_size    (lm_ggml_backend_buffer_type_t buft);
+    LM_GGML_API size_t                lm_ggml_backend_buft_get_alloc_size  (lm_ggml_backend_buffer_type_t buft, const struct lm_ggml_tensor * tensor);
+    LM_GGML_API size_t                lm_ggml_backend_buft_get_alloc_size_n(lm_ggml_backend_buffer_type_t buft, struct lm_ggml_tensor ** tensors, int n_tensors);
+    LM_GGML_API bool                  lm_ggml_backend_buft_is_host         (lm_ggml_backend_buffer_type_t buft);
+    LM_GGML_API lm_ggml_backend_dev_t    lm_ggml_backend_buft_get_device      (lm_ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -154,6 +156,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // mmap is supported for loading
+        bool mmap_support;
     };
 
     // all the device properties
@@ -313,6 +317,23 @@ extern "C" {
     //
     typedef bool (*lm_ggml_backend_sched_eval_callback)(struct lm_ggml_tensor * t, bool ask, void * user_data);
 
+    // Callback while copying input weights of a split
+    // if the user returns false the scheduler simply copies the entire weight
+    // the callback is called only for input weights in host buffers
+    // the callback is called after all non-weight inputs of the split have been copied
+    // `src` is the tensor in the previous split
+    // `dst` is the copy of `src` in the split
+    // `graph` is the compute graph of the split
+    typedef bool (*lm_ggml_backend_sched_copy_callback)(lm_ggml_backend_t backend, const struct lm_ggml_tensor * src, struct lm_ggml_tensor * dst, struct lm_ggml_cgraph * graph, void * user_data);
+
+    // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+    // it happens on the graph allocation path and costs a synchronization of the backends
+    // `sched` is the scheduler
+    // `graph` is the compute graph being allocated
+    // `backend_ids_changed` is true if the backend assignment of the graph nodes changed since the last allocation
+    // `graph_size_changed` is true if the graph size changed since the last allocation
+    typedef void (*lm_ggml_backend_sched_realloc_callback)(lm_ggml_backend_sched_t sched, struct lm_ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     LM_GGML_API lm_ggml_backend_sched_t lm_ggml_backend_sched_new(lm_ggml_backend_t * backends, lm_ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     LM_GGML_API void                 lm_ggml_backend_sched_free(lm_ggml_backend_sched_t sched);
@@ -351,6 +372,12 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     LM_GGML_API void                 lm_ggml_backend_sched_set_eval_callback(lm_ggml_backend_sched_t sched, lm_ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Set a callback to be called when the inputs weights of a split are being copied
+    LM_GGML_API void                 lm_ggml_backend_sched_set_copy_callback(lm_ggml_backend_sched_t sched, lm_ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Set a callback to be called when the compute buffers of a graph are being reallocated
+    LM_GGML_API void                 lm_ggml_backend_sched_set_realloc_callback(lm_ggml_backend_sched_t sched, lm_ggml_backend_sched_realloc_callback callback, void * user_data);
+
     //
     // Meta backend
     //
@@ -381,6 +408,7 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
+        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to lm_ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],

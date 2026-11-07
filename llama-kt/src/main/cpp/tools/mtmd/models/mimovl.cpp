@@ -2,7 +2,7 @@
 
 lm_ggml_tensor * clip_graph_mimovl::build_mm(lm_ggml_tensor * w, lm_ggml_tensor * x) const {
     lm_ggml_tensor * cur = lm_ggml_mul_mat(ctx0, w, x);
-    lm_ggml_mul_mat_set_prec(cur, LM_GGML_PREC_F32);
+    lm_ggml_prec_set_acc(cur, LM_GGML_PREC_F32);
     return cur;
 }
 
@@ -84,13 +84,7 @@ lm_ggml_cgraph * clip_graph_mimovl::build() {
     lm_ggml_tensor * idx_col     = lm_ggml_cast(ctx0, idx_col_f, LM_GGML_TYPE_I32);
     lm_ggml_tensor * idx_col_inv = lm_ggml_argsort(ctx0, idx_col_f, LM_GGML_SORT_ORDER_ASC);
 
-    lm_ggml_tensor * window_mask = lm_ggml_new_tensor_2d(ctx0, LM_GGML_TYPE_F32, n_pos, n_pos);
-    lm_ggml_set_name(window_mask, "mimovl_window_mask");
-    lm_ggml_set_input(window_mask);
-
-    lm_ggml_tensor * window_mask_attn = (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED)
-        ? lm_ggml_cast(ctx0, window_mask, LM_GGML_TYPE_F16)
-        : window_mask;
+    lm_ggml_tensor * window_mask = build_inp_attn_mask(n_pos, n_pos);
 
     // Reorder helper: permute patches at merge-unit granularity. The patch
     // sequence is laid out as n_units groups of merge_unit (=4) consecutive
@@ -151,7 +145,7 @@ lm_ggml_cgraph * clip_graph_mimovl::build() {
         cb(Kcur, "Kcur_rope", il);
 
         // Full layers: plain attention. Windowed layers: banded mask and per-head sinks.
-        lm_ggml_tensor * mask  = is_full ? nullptr : window_mask_attn;
+        lm_ggml_tensor * mask  = is_full ? nullptr : window_mask;
         lm_ggml_tensor * sinks = is_full ? nullptr : layer.attn_sinks;
         if (!is_full) {
             LM_GGML_ASSERT(layer.attn_sinks != nullptr);

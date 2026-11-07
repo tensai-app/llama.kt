@@ -47,6 +47,7 @@ set(GGML_CORE_SOURCES
 file(GLOB GGML_CPU_C_FILES   CONFIGURE_DEPENDS ${SRC_DIR}/ggml-cpu/*.c)
 file(GLOB GGML_CPU_CPP_FILES CONFIGURE_DEPENDS ${SRC_DIR}/ggml-cpu/*.cpp)
 file(GLOB GGML_CPU_AMX_FILES CONFIGURE_DEPENDS ${SRC_DIR}/ggml-cpu/amx/*.cpp)
+file(GLOB GGML_CPU_TILED_FILES CONFIGURE_DEPENDS ${SRC_DIR}/ggml-cpu/tiled/*.cpp)
 
 # ARM arch-specific files
 set(GGML_CPU_ARCH_SOURCES
@@ -65,6 +66,7 @@ set(LLAMA_EXTRA_SOURCES
 # Common utilities
 file(GLOB COMMON_FILES CONFIGURE_DEPENDS ${SRC_DIR}/common/*.cpp)
 file(GLOB JINJA_FILES  CONFIGURE_DEPENDS ${SRC_DIR}/common/jinja/*.cpp)
+file(GLOB PARSER_FILES CONFIGURE_DEPENDS ${SRC_DIR}/common/parsers/*.cpp)
 
 # Multimodal (mtmd)
 file(GLOB MTMD_FILES       CONFIGURE_DEPENDS ${SRC_DIR}/tools/mtmd/*.cpp)
@@ -77,10 +79,11 @@ file(GLOB MODEL_FILES CONFIGURE_DEPENDS ${SRC_DIR}/models/*.cpp)
 set(RN_GLUE_SOURCES
     ${SRC_DIR}/rn-llama.cpp
     ${SRC_DIR}/rn-completion.cpp
-    ${SRC_DIR}/rn-tts.cpp
+    ${SRC_DIR}/rn-decision.cpp
     ${SRC_DIR}/rn-slot.cpp
     ${SRC_DIR}/rn-slot-manager.cpp
-    ${SRC_DIR}/anyascii.c
+    # rn-tts.cpp is not vendored (codec.cpp, see bootstrap.sh): its methods are stubs
+    ${SRC_DIR}/tensai_tts_stub.cpp
 )
 
 # JSI helpers
@@ -92,182 +95,22 @@ set(JSI_SOURCES
 set(JNI_STUB ${SRC_DIR}/tensai_jni.cpp)
 
 # ── Vulkan backend + generated SPIR-V shaders ────────────────────────────────
-set(GGML_VULKAN_SOURCES
-    ${SRC_DIR}/ggml-vulkan/ggml-vulkan.cpp
+file(GLOB GGML_VULKAN_SOURCES CONFIGURE_DEPENDS
+    ${SRC_DIR}/ggml-vulkan/*.cpp
 )
 file(GLOB GGML_VULKAN_SHADER_SOURCES CONFIGURE_DEPENDS
     ${SRC_DIR}/ggml-vulkan/shaders/*.cpp
 )
 
 # ── OpenCL kernel embedding ──────────────────────────────────────────────────
-set(GGML_OPENCL_KERNELS
-    add
-    add_id
-    argsort
-    tri
-    fill
-    clamp
-    cpy
-    cvt
-    diag_mask_inf
-    diag
-    div
-    gelu
-    get_rows
-    glu
-    group_norm
-    solve_tri
-    im2col_f32
-    im2col_f16
-    mean
-    mul_mv_f16_f16
-    mul_mv_f16_f32_1row
-    mul_mv_f16_f32_l4
-    mul_mv_f16_f32
-    mul_mv_f32_f32
-    mul_mv_q4_0_f32
-    mul_mv_q4_0_f32_v
-    mul_mv_q4_0_f32_8x_flat
-    mul_mv_q4_0_f32_1d_8x_flat
-    mul_mv_q4_0_f32_1d_16x_flat
-    mul_mv_q4_1_f32
-    mul_mv_q4_1_f32_flat
-    mul_mv_q4_k_f32
-    mul_mv_q4_k_f32_flat
-    mul_mv_q5_0_f32
-    mul_mv_q5_0_f32_flat
-    mul_mv_q5_1_f32
-    mul_mv_q5_1_f32_flat
-    mul_mv_q5_k_f32
-    mul_mv_q5_k_f32_flat
-    mul_mv_q6_k_f32
-    mul_mv_q6_k_f32_flat
-    mul_mv_q8_0_f32
-    mul_mv_q8_0_f32_flat
-    mul_mv_q1_0_f32
-    mul_mv_q1_0_f32_flat
-    mul_mv_iq4_nl_f32
-    mul_mv_iq4_nl_f32_flat
-    mul_mv_mxfp4_f32
-    mul_mv_mxfp4_f32_flat
-    mul_mv_id_q4_0_f32_8x_flat
-    mul_mv_id_q8_0_f32
-    mul_mv_id_q8_0_f32_flat
-    mul_mv_id_mxfp4_f32
-    mul_mv_id_mxfp4_f32_flat
-    gemm_moe_q4_0_f32_ns
-    gemm_moe_q4_0_q8_1_dp4a
-    gemv_moe_q4_0_f32_ns
-    gemm_moe_q8_0_f32_ns
-    gemm_moe_q4_1_f32_ns
-    gemv_moe_q4_1_f32_ns
-    gemm_moe_q5_0_f32_ns
-    gemv_moe_q5_0_f32_ns
-    gemm_moe_q5_1_f32_ns
-    gemv_moe_q5_1_f32_ns
-    gemm_moe_q4_k_f32_ns
-    gemm_moe_q4_k_q8_1_dp4a
-    gemm_moe_q6_k_q8_1_dp4a
-    gemm_moe_q8_1_dp4a
-    moe_reorder_quant_a_q8_1
-    gemm_noshuffle_q4_k_q8_1_dp4a
-    gemm_noshuffle_q5_k_q8_1_dp4a
-    gemm_noshuffle_q6_k_q8_1_dp4a
-    gemm_noshuffle_q8_0_q8_1_dp4a
-    gemm_noshuffle_q5_0_q8_1_dp4a
-    gemm_noshuffle_iq4_nl_q8_1_dp4a
-    gemm_noshuffle_q4_0_q8_1_dp4a
-    quant_a_q8_1
-    gemv_moe_q4_k_f32_ns
-    gemm_moe_q5_k_f32_ns
-    gemv_moe_q5_k_f32_ns
-    gemm_moe_q6_k_f32_ns
-    gemv_moe_q6_k_f32_ns
-    gemm_moe_mxfp4_f32
-    gemv_moe_mxfp4_f32
-    gemm_moe_mxfp4_f32_ns
-    gemm_moe_mxfp4_q8_1_dp4a
-    gemv_moe_mxfp4_f32_ns
-    moe_reorder_b
-    moe_combine
-    moe_sort_by_expert
-    mul_mm_f32_f32_l4_lm
-    mul_mm_f16_f32_l4_lm
-    mul_mm_q4_0_f32_l4_lm
-    mul_mm_q4_1_f32_l4_lm
-    mul_mm_q5_0_f32_l4_lm
-    mul_mm_q5_1_f32_l4_lm
-    mul_mm_q8_0_f32_l4_lm
-    mul_mm_q1_0_f32_l4_lm
-    mul_mm_iq4_nl_f32_l4_lm
-    mul_mm_q4_k_f32_l4_lm
-    mul_mm_q5_k_f32_l4_lm
-    mul_mm_q6_k_f32_l4_lm
-    gemv_noshuffle_q4_0_f32
-    gemv_noshuffle_q4_0_f32_spec
-    gemm_noshuffle_q4_0_f32
-    gemv_noshuffle_q4_1_f32
-    gemm_noshuffle_q4_1_f32
-    gemv_noshuffle_iq4_nl_f32
-    gemm_noshuffle_iq4_nl_f32
-    gemv_noshuffle_q5_0_f32
-    gemm_noshuffle_q5_0_f32
-    gemv_noshuffle_q5_1_f32
-    gemm_noshuffle_q5_1_f32
-    gemv_noshuffle_q8_0_f32
-    gemm_noshuffle_q8_0_f32
-    gemv_noshuffle_q1_0_f32
-    gemm_noshuffle_q1_0_f32
-    gemv_noshuffle_q4_k_f32
-    gemm_noshuffle_q4_k_f32
-    gemv_noshuffle_q6_k_f32
-    gemm_noshuffle_q6_k_f32
-    gemv_noshuffle_q5_k_f32
-    gemm_noshuffle_q5_k_f32
-    mul
-    neg
-    norm
-    relu
-    l2_norm
-    rms_norm
-    rope
-    scale
-    set_rows
-    sigmoid
-    silu
-    softmax_4_f32
-    softmax_4_f16
-    softmax_f32
-    softmax_f16
-    sqr
-    sqrt
-    ssm_conv
-    gated_delta_net
-    sub
-    sum_rows
-    cumsum
-    transpose
-    concat
-    tsembd
-    upscale
-    tanh
-    exp
-    expm1
-    softplus
-    pad
-    repeat
-    mul_mat_f16_f32
-    mul_mm_f16_f32_kq_kqv
-    conv2d
-    conv2d_f16_f32
-    flash_attn_f32_f16
-    flash_attn_f16
-    flash_attn_f32
-    flash_attn_pre_f16
-    flash_attn_f32_q8_0
-    flash_attn_f32_q4_0
-    gemm_xmem_f16_f32_os8
-)
+# Every kernel the vendored backend ships: ggml-opencl.cpp includes the ones it uses as <name>.cl.h, and a header
+# nobody includes adds nothing to the library. A list kept by hand fell behind upstream at each bump.
+file(GLOB GGML_OPENCL_KERNEL_FILES CONFIGURE_DEPENDS ${SRC_DIR}/ggml-opencl/kernels/*.cl)
+set(GGML_OPENCL_KERNELS "")
+foreach(kernel_file ${GGML_OPENCL_KERNEL_FILES})
+    get_filename_component(kernel ${kernel_file} NAME_WE)
+    list(APPEND GGML_OPENCL_KERNELS ${kernel})
+endforeach()
 
 set(GGML_OPENCL_KERNEL_DIR ${SRC_DIR}/ggml-opencl/kernels)
 set(GGML_OPENCL_KERNEL_HEADERS "")
@@ -292,11 +135,16 @@ add_library(llamakt SHARED
     ${GGML_CPU_C_FILES}
     ${GGML_CPU_CPP_FILES}
     ${GGML_CPU_AMX_FILES}
+    ${GGML_CPU_TILED_FILES}
     ${GGML_CPU_ARCH_SOURCES}
     ${LLAMA_FILES}
     ${LLAMA_EXTRA_SOURCES}
     ${COMMON_FILES}
     ${JINJA_FILES}
+    ${PARSER_FILES}
+    # mtmd-helper hashes media inputs (vendor/hash, as llama.rn builds it)
+    ${SRC_DIR}/hash/hash.cpp
+    ${SRC_DIR}/hash/sha256/sha256.c
     ${MTMD_MODEL_FILES}
     ${MTMD_FILES}
     ${MODEL_FILES}
@@ -304,6 +152,7 @@ add_library(llamakt SHARED
     ${JSI_SOURCES}
     # OpenCL backend
     ${SRC_DIR}/ggml-opencl/ggml-opencl.cpp
+    ${SRC_DIR}/ggml-opencl/cl-program-cache.cpp
     ${GGML_OPENCL_KERNEL_HEADERS}
     # Vulkan backend + SPIR-V shaders
     ${GGML_VULKAN_SOURCES}
@@ -320,6 +169,8 @@ target_include_directories(llamakt PRIVATE
     ${SRC_DIR}/ggml-cpu
     ${SRC_DIR}/tools/mtmd
     ${SRC_DIR}/nlohmann
+    # vendor/hash: sha256.c includes "rotate-bits/rotate-bits.h"
+    ${SRC_DIR}/hash
     ${SRC_DIR}/jsi
     # OpenCL headers (third_party, relative to repo root)
     ${SRC_DIR}/../../../../third_party/OpenCL-Headers

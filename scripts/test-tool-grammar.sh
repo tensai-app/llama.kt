@@ -27,10 +27,13 @@ SOURCES=(
   common/chat.cpp common/chat-auto-parser-generator.cpp common/chat-auto-parser-helpers.cpp
   common/chat-diff-analyzer.cpp common/chat-peg-parser.cpp common/peg-parser.cpp
   common/json-schema-to-grammar.cpp common/common.cpp common/log.cpp common/unicode.cpp
+  common/json.cpp common/json-schema.cpp common/trie.cpp
   common/jinja/caps.cpp common/jinja/lexer.cpp common/jinja/parser.cpp common/jinja/runtime.cpp
   common/jinja/string.cpp common/jinja/value.cpp
   llama-grammar.cpp llama-vocab.cpp llama-impl.cpp unicode.cpp unicode-data.cpp ggml.c
 )
+# The per-model parsers chat.cpp dispatches to (common/parsers/ since b11960).
+for f in "$CPP"/common/parsers/*.cpp; do SOURCES+=("common/parsers/${f##*/}"); done
 
 # One compiler per source, in parallel: the chat layer is the slow part.
 export CPP OUT CXX_BIN CC_BIN

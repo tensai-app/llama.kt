@@ -1,16 +1,15 @@
 diff --git a/llama-kt/src/main/cpp/rn-completion.cpp b/llama-kt/src/main/cpp/rn-completion.cpp
-index 1b4dd4e..e99cfd9 100644
 --- a/llama-kt/src/main/cpp/rn-completion.cpp
 +++ b/llama-kt/src/main/cpp/rn-completion.cpp
-@@ -5,6 +5,7 @@
- #include "rn-common.hpp"
+@@ -6,6 +6,7 @@
+ #include "llama-ext.h"  // llama_get_ctx_other (mem-shared MTP draft detection)
  #include "tensai_kv_reuse.h"
  #include "llama-context.h"  // llama_context::memory_update(), no public entry point
 +#include "llama-kv-cache.h"  // llama_kv_cache::get_has_shift(), same
  
  #include <algorithm>
- #include <cstring>
-@@ -243,10 +244,27 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
+ #include <cmath>
+@@ -580,10 +581,29 @@
                              // llama_decode() makes first thing; there is no public entry.
                              const int64_t t0 = lm_ggml_time_us();
                              parent_ctx->ctx->memory_update(false);
@@ -31,6 +30,8 @@ index 1b4dd4e..e99cfd9 100644
 +                                    LOG_WARNING("kv reuse: memory is not a llama_kv_cache, shift cannot be checked");
 +                                }
 +                                n_past = moves.front().dst;
++                                // has_shift stays set (llama_kv_cells::reset_shift() is not reachable
++                                // from here): the next decode runs one K-shift pass, all deltas zero.
 +                                LOG_WARNING("kv reuse: shift failed, re-prefilling %zu tokens",
 +                                    text_tokens.size() - (size_t) n_past);
 +                            } else {

@@ -205,9 +205,6 @@ std::pair<lm_ggml_tensor *, lm_ggml_tensor *> llm_build_delta_net_base::build_de
             lm_ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
     cb(g_last, "g_last", il);
 
-    // TODO: remove this cont when CUDA supports non-cont unary ops
-    g_last = lm_ggml_cont(ctx0, g_last);
-
     // [1, 1, n_chunks, H_v * n_seqs] KDA: [S_k, 1, n_chunks, H_v * n_seqs]
     lm_ggml_tensor * g_last_exp_t = lm_ggml_transpose(ctx0, lm_ggml_exp(ctx0, g_last));
     cb(g_last_exp_t, "g_last_exp_t", il);

@@ -1,8 +1,7 @@
 diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-index 599d60c..3d13183 100644
 --- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
 +++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
-@@ -16344,6 +16344,25 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
+@@ -14471,6 +14471,25 @@
      }
      uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
  
@@ -25,15 +24,15 @@ index 599d60c..3d13183 100644
 +        flops_per_submit = submit_mflops_override * 1'000'000ULL;
 +    }
 +
-     for (int i = 0; i < cgraph->n_nodes; i++) {
-         if (first_node_in_batch) {
-             submit_node_idx = i;
-@@ -16600,7 +16619,7 @@ static lm_ggml_status lm_ggml_backend_vk_graph_compute(lm_ggml_backend_t backend
-             first_node_in_batch = true;
-             submitted_nodes = 0;
-             batch_flops = 0;
--            if (submit_count < 3) {
-+            if (submit_count < 3 && submit_mflops_override == 0) {
-                 flops_per_submit *= 2;
-             }
-             submit_count++;
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+             try {
+@@ -14495,7 +14514,7 @@
+         first_node_in_batch = true;
+         submitted_nodes = 0;
+         batch_flops = 0;
+-        if (submit_count < 3) {
++        if (submit_count < 3 && submit_mflops_override == 0) {
+             flops_per_submit *= 2;
+         }
+         submit_count++;
