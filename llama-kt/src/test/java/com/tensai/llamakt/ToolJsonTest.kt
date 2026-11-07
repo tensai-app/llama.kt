@@ -13,7 +13,7 @@ class ToolJsonTest {
     fun plainMessageKeepsTheOldShape() {
         val arr = ToolJson.messages(listOf(ChatMessage("user", "salut")))
         val obj = arr.getJSONObject(0)
-        assertEquals(setOf("role", "content"), obj.keySet())
+        assertEquals(setOf("role", "content"), obj.keys().asSequence().toSet())
         assertEquals("salut", obj.getString("content"))
     }
 
