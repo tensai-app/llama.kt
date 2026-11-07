@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 #include "chat.h"
 #include "speculative.h"
+#include "tensai_input_ranges.h"
 #include <atomic>
 #include <deque>
 
@@ -90,6 +91,15 @@ struct llama_rn_context_completion {
     // llama_decode() failed for a reason other than an abort (nextToken()). Reset by
     // rewind(). Without it a failed decode ended like an EOS and read as a finished reply.
     bool decode_failed = false;
+    // Bytes of params.prompt that came from the messages and hold special-token text
+    // (TEN-218, tensai_input_ranges.h): loadPrompt() tokenizes them as text. Set by
+    // the caller before each loadPrompt(); empty keeps the single tokenize call.
+    std::vector<tensai_input::Range> input_ranges;
+    // The texts of the model's special tokens, the ones the ranges are cut through.
+    // Filled by the caller once per model; special_texts_ready says it was, even when
+    // the vocabulary has none.
+    std::vector<std::string> special_texts;
+    bool special_texts_ready = false;
     std::string prefill_text;
     std::string generated_text;
     std::vector<float> embeddings;

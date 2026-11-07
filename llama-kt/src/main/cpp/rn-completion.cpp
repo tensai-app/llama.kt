@@ -488,7 +488,19 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         }
 
         // Text-only path - use modified tokenization for encoder-decoder models
-        text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, add_bos || is_enc_dec, true);
+        if (input_ranges.empty()) {
+            text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, add_bos || is_enc_dec, true);
+        } else {
+            // Same BOS/EOS as common_tokenize(add_special) around the pieces.
+            const auto pieces = tensai_input::tokenize(parent_ctx->params.prompt, input_ranges, special_texts,
+                [&](const std::string & piece, bool parse_special) {
+                    return ::common_tokenize(vocab, piece, false, parse_special);
+                });
+            if ((add_bos || is_enc_dec) && llama_vocab_get_add_bos(vocab)) text_tokens.push_back(llama_vocab_bos(vocab));
+            text_tokens.insert(text_tokens.end(), pieces.begin(), pieces.end());
+            if ((add_bos || is_enc_dec) && llama_vocab_get_add_eos(vocab)) text_tokens.push_back(llama_vocab_eos(vocab));
+            LOG_INFO("Input text: %zu range(s) tokenized without special tokens", input_ranges.size());
+        }
         num_prompt_tokens = text_tokens.size();
 
 

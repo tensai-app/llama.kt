@@ -38,6 +38,7 @@
 #include "gguf.h"
 #include "llama-arch.h"
 #include "tensai_completion_result.h"
+#include "tensai_input_ranges.h"
 #include "tensai_tool_grammar.h"
 #include "tensai_utf.h"
 #include "tensai_chat_templates.hpp"
@@ -46,6 +47,7 @@
 
 #define LOG_TAG "TensaiJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
@@ -420,6 +422,57 @@ static void chat_state_set_result(const void* key, bool parse_failed, bool trunc
     s.result_content    = std::move(content);
     s.result_reasoning  = std::move(reasoning);
     s.result_tool_calls = std::move(calls);
+}
+
+// TEN-218: the input ranges (tensai_input_ranges.h) of the last few prompts nativeFormatChat()
+// produced, per native context. Under g_chat_state_mu.
+static std::map<const void*, tensai_input::RecentPrompts> g_input_ranges;
+
+static void input_ranges_put(const void* key, std::string prompt, std::vector<tensai_input::Range> ranges) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    g_input_ranges[key].put(std::move(prompt), std::move(ranges));
+}
+
+static std::vector<tensai_input::Range> input_ranges_for(const void* key, const std::string& text) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    auto it = g_input_ranges.find(key);
+    if (it == g_input_ranges.end()) return {};
+    bool matched = false;
+    auto ranges = it->second.for_text(text, &matched);
+    if (!matched && it->second.resembles(text)) {
+        // A formatted prompt changed between nativeFormatChat() and here: its ranges are lost and
+        // it is tokenized with special tokens parsed everywhere. Counts only, never the text.
+        LOGW("input ranges: no recorded prompt matches this %zu-byte text that starts like one, parsed as before",
+             text.size());
+    }
+    return ranges;
+}
+
+// The texts of the special tokens the tokenizer matches in raw text (CONTROL, USER_DEFINED and
+// UNKNOWN, as llama_vocab builds cache_special_tokens), built once on first use and kept on the
+// completion object, which lives as long as the model. Engine thread only, like its callers.
+static const std::vector<std::string>& special_texts(rnllama::llama_rn_context* rnctx) {
+    static const std::vector<std::string> none;
+    if (rnctx->completion == nullptr) return none;
+    auto& texts = rnctx->completion->special_texts;
+    if (!rnctx->completion->special_texts_ready) {
+        rnctx->completion->special_texts_ready = true;
+        const llama_vocab* vocab = llama_model_get_vocab(rnctx->model);
+        const int32_t n = llama_vocab_n_tokens(vocab);
+        for (llama_token id = 0; id < n; id++) {
+            const auto attr = llama_vocab_get_attr(vocab, id);
+            if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN)) {
+                texts.emplace_back(llama_vocab_get_text(vocab, id));
+            }
+        }
+        LOGI("input ranges: %zu special token texts", texts.size());
+    }
+    return texts;
+}
+
+static void input_ranges_erase(const void* key) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    g_input_ranges.erase(key);
 }
 
 // Some parsers (Hermes-style JSON, for one) leave the call id empty. The app matches a tool
@@ -1213,6 +1266,7 @@ static void free_impl(jlong h)
     auto* rnctx = to_ctx(h);
     LOGI("nativeFree ptr=%p", rnctx);
     chat_state_erase(rnctx);
+    input_ranges_erase(rnctx);
     delete rnctx;
 }
 
@@ -1485,6 +1539,8 @@ static jint completion_impl(
     // (early exits after rewind()) embd still describes the warm cache and n_past
     // is a meaningless 0: trimming then would wipe a valid cache.
     prompt_started = true;
+    comp->input_ranges = input_ranges_for(rnctx, rnctx->params.prompt);
+    special_texts(rnctx);
     comp->loadPrompt({});
 
     // TEN-47: hand the chat format / reasoning format / generation prompt /
@@ -1964,6 +2020,8 @@ static jint prefill_impl(
     rnctx->params.prompt = text;
     rnctx->params.n_predict = 0;  // read by nextToken(): decode the prompt, sample nothing
     comp->rewind();
+    comp->input_ranges = input_ranges_for(rnctx, text);
+    special_texts(rnctx);
     comp->loadPrompt({});  // logs "Input processed: n_past=..." like a completion does
 
     const size_t target = comp->embd.size();
@@ -2043,6 +2101,7 @@ static jstring formatChat_impl(
     }
 
     std::string formatted;
+    std::vector<tensai_input::Range> ranges;
     try {
         // Jinja path: honors enable_thinking (Qwen3 & other thinking models
         // render an empty think block / no think prompt when disabled).
@@ -2071,9 +2130,15 @@ static jstring formatChat_impl(
             /* chat_template_kwargs */ {},
             /* force_pure_content*/ false
         );
-        // The flat string, as rn-llama's own formatter does: the user-input parts of the
-        // prompt are tokenized with special tokens parsed, as before b11960.
+        // The flat string, as rn-llama's own formatter does. The message parts holding
+        // special-token text are recorded below and tokenized as text (TEN-218).
         formatted = params.prompt.str();
+        {
+            std::vector<std::pair<std::string, bool>> parts;
+            parts.reserve(params.prompt.parts.size());
+            for (const auto& part : params.prompt.parts) parts.emplace_back(part.text, part.is_input);
+            ranges = tensai_input::dirty_ranges(parts, special_texts(rnctx));
+        }
 
         chat_parse_state state;
         state.parsable          = true;
@@ -2109,6 +2174,8 @@ static jstring formatChat_impl(
     } catch (const std::exception& e) {
         // Some templates fail under jinja — fall back to the legacy path
         // (no thinking control there).
+        // That renderer does not mark the message parts: no ranges (TEN-218 does not cover it).
+        ranges.clear();
         if (!tools.empty()) {
             LOGE("nativeFormatChat: tools rendering failed, tools dropped (legacy renderer has none): %s", loggable_what(e).c_str());
         }
@@ -2133,7 +2200,8 @@ static jstring formatChat_impl(
         }
     }
 
-    LOGI("nativeFormatChat: formatted %zu chars (thinking=%d)", formatted.size(), enableThinking);
+    LOGI("nativeFormatChat: formatted %zu chars (thinking=%d, input ranges=%zu)", formatted.size(), enableThinking,
+         ranges.size());
 
     jstring jformatted = std_to_jstring(env, formatted);
     // Record the prompt as nativeCompletion will actually see it, not as it was
@@ -2145,7 +2213,14 @@ static jstring formatChat_impl(
     // emit anything): each ill-formed subpart comes back as U+FFFD, and storing
     // the round-tripped string keeps the check true for that prompt instead of
     // silently disabling the reasoning split.
-    chat_state_set_prompt(rnctx, jstring_to_std(env, jformatted));
+    std::string round_tripped = jstring_to_std(env, jformatted);
+    // The ranges are byte offsets into `formatted`, which only a template emitting ill-formed UTF-8
+    // changes on the way (message text is well-formed, lone surrogates already became U+FFFD). Then
+    // they cannot be mapped: all of it as text, a broken turn rather than a forged one. Recorded
+    // either way, so that a stale entry never answers for this prompt.
+    if (round_tripped != formatted && !ranges.empty()) ranges = {{0, round_tripped.size()}};
+    input_ranges_put(rnctx, round_tripped, std::move(ranges));
+    chat_state_set_prompt(rnctx, std::move(round_tripped));
     return jformatted;
 }
 
@@ -2182,10 +2257,16 @@ static jintArray tokenize_impl(
     auto* rnctx = to_ctx(h);
 
     std::string txt = jstring_to_std(env, text);
-    // No media — plain text tokenisation
-    rnllama::llama_rn_tokenize_result result = rnctx->tokenize(txt, {});
+    // No media: plain text tokenisation. A formatted prompt with input ranges counts as
+    // loadPrompt() will tokenize it (TEN-218), still without BOS.
+    const auto ranges = input_ranges_for(rnctx, txt);
+    const llama_vocab* vocab = llama_model_get_vocab(rnctx->model);
+    const std::vector<llama_token> tokens = ranges.empty()
+        ? rnctx->tokenize(txt, {}).tokens
+        : tensai_input::tokenize(txt, ranges, special_texts(rnctx), [&](const std::string& piece, bool parse_special) {
+              return common_tokenize(vocab, piece, false, parse_special);
+          });
 
-    const auto& tokens = result.tokens;
     jintArray arr = env->NewIntArray(static_cast<jsize>(tokens.size()));
     if (arr == nullptr) return env->NewIntArray(0);
 
@@ -2207,6 +2288,31 @@ Java_com_tensai_llamakt_LlamaEngine_nativeTokenize(
     return jni_guard("nativeTokenize",
                      [&] { return tokenize_impl(env, h, text); },
                      [&] { return env->NewIntArray(0); });
+}
+
+// ---------------------------------------------------------------------------
+// nativeHasInputRanges (TEN-218)
+// ---------------------------------------------------------------------------
+// True when `text`, a formatted prompt or the start of one, has message text holding special-token
+// text that loadPrompt() tokenizes as text. The prefix cache keys its files on the text alone, so
+// such a prefix must neither be saved nor restored: the same bytes from a genuine template would
+// get the genuine control tokens back from the file.
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeHasInputRanges(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring text)
+{
+    // On a throw, true: the caller then stays off the cache, the safe side.
+    return jni_guard("nativeHasInputRanges",
+                     [&] {
+                         if (h == 0L) return (jboolean) JNI_FALSE;
+                         const bool has = !input_ranges_for(to_ctx(h), jstring_to_std(env, text)).empty();
+                         return has ? (jboolean) JNI_TRUE : (jboolean) JNI_FALSE;
+                     },
+                     [&] { return (jboolean) JNI_TRUE; });
 }
 
 // ---------------------------------------------------------------------------

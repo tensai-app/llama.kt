@@ -146,6 +146,13 @@ jobs:
       - name: Tool-call grammar test
         run: scripts/test-tool-grammar.sh
 
+      # Reads llama.cpp's vocab-only tokenizer-test GGUFs, hence the checkout, even
+      # on a shader cache hit. CI=true makes a missing vocabulary a failure.
+      - name: Input ranges test
+        run: |
+          git submodule update --init --depth 1 third_party/llama.cpp
+          scripts/test-input-ranges.sh
+
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin

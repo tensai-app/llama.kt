@@ -319,6 +319,14 @@ class LlamaEngine {
      */
     fun tokenize(text: String): IntArray = nativeTokenize(handle, text)
 
+    /**
+     * Whether [text], a prompt [formatChatWithTools] returned or the start of one, has message text
+     * holding special-token text, which [completion] and [prefill] tokenize as text rather than as
+     * control tokens. A cache keyed on the text alone must not hold such a prompt: the same bytes
+     * written by the template itself would get the control tokens back from it.
+     */
+    fun hasInputRanges(text: String): Boolean = nativeHasInputRanges(handle, text)
+
     /** Number of tokens currently occupying the KV cache (sequence 0). */
     fun kvUsed(): Int = nativeKvCacheUsedCells(handle)
 
@@ -532,6 +540,7 @@ class LlamaEngine {
     ): String
     private external fun nativeChatResult(h: Long): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
+    private external fun nativeHasInputRanges(h: Long, text: String): Boolean
     private external fun nativeKvCacheUsedCells(h: Long): Int
     private external fun nativePerf(h: Long): DoubleArray
     private external fun nativeInterrupt(h: Long)
