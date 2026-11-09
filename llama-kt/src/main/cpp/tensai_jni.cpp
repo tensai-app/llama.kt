@@ -1325,6 +1325,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // a prompt served from the KV cache reads small (TEN-182: prefill measured at ~6 tok/s).
 static void log_perf(const char* where, rnllama::llama_rn_context* rnctx) {
     if (rnctx == nullptr || rnctx->ctx == nullptr) return;
+    // llama.cpp adds a decode to the counters only at its next synchronize (LKT-53): a prefill
+    // reads no logits, so without this its counters were still empty ("1 tok in 0 ms").
+    llama_synchronize(rnctx->ctx);
     const llama_perf_context_data d = llama_perf_context(rnctx->ctx);
     LOGI("%s: perf prompt_eval %d tok in %.0f ms (%.1f tok/s), eval %d tok in %.0f ms (%.1f tok/s), "
          "n_threads=%d n_threads_batch=%d n_ubatch=%u",
