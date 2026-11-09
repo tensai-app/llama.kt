@@ -1044,6 +1044,15 @@ std::unique_ptr<vk_queue> lm_ggml_vk_create_queue(vk_device& device, uint32_t qu
     }
 
     h->queue = device->device.getQueue2(queue_info2);
+    // Tensai: some Mali drivers return a null queue from getQueue2() even without flags; the
+    // Vulkan 1.0 getQueue() is only valid for queues created without flags.
+    if (!h->queue && !device->has_internally_synchronized_queues) {
+        LM_GGML_LOG_WARN("vk: getQueue2 returned a null queue (family %u, index %u), using getQueue\n", queue_family_index, queue_index);
+        h->queue = device->device.getQueue(queue_family_index, queue_index);
+    }
+    if (!h->queue) {
+        LM_GGML_ABORT("vk: no queue for family %u, index %u", queue_family_index, queue_index);
+    }
     h->device = device;
     // Avoid concurrent submissions on NVIDIA due to driver bug.
     if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
@@ -4531,6 +4540,11 @@ vk_device lm_ggml_vk_get_device(size_t idx) {
         device->device_fault = device->device_fault && fault_features.deviceFault;
 
         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
+        // Tensai: Mali drivers advertise internally synchronized queues, then getQueue2() with that
+        // flag returns a null queue and the first submit crashes (llama.cpp issue 30920).
+        if (device->vendor_id == 0x13B5) {
+            device->has_internally_synchronized_queues = false;
+        }
 
         // Build queue create infos only after querying whether internally synchronized queues are enabled.
         // getQueue2() later uses the same flag, so creation/retrieval must stay consistent.
@@ -16416,6 +16430,12 @@ static bool lm_ggml_backend_vk_device_offload_op(lm_ggml_backend_dev_t dev, cons
 static lm_ggml_backend_event_t lm_ggml_backend_vk_device_event_new(lm_ggml_backend_dev_t dev) {
     lm_ggml_backend_vk_device_context * ctx = (lm_ggml_backend_vk_device_context *)dev->context;
     auto device = lm_ggml_vk_get_device(ctx->device);
+
+    // Tensai: a Vulkan 1.1 driver (Mali) leaves vkWaitSemaphores null in the dispatcher, and
+    // event_synchronize would call it. No event makes the model loader upload synchronously.
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores) {
+        return nullptr;
+    }
 
     vk_event *vkev = new vk_event;
     if (!vkev) {
