@@ -498,13 +498,34 @@ static std::string gen_tool_call_id() {
 //   deviceName - ggml device id (e.g. "Vulkan0"), not a hardware name
 //   deviceDescription - driver-reported hardware name (e.g. "Mali-G68 MC4"), may be empty
 
-// backend_devices_info() builds and dumps a nlohmann::json out of driver-
-// supplied device names, so it throws on the same UTF-8 rule as everything
-// else — the fallback is an empty JSON array, which availableBackends()
-// parses into an empty list rather than a null it doesn't expect.
+// backend_devices_info() returns a nlohmann::json array since llama.rn 0.13
+// (a dumped string before): assigning it to a std::string compiles but throws
+// type_error 302 at runtime, so dump() it explicitly. dump() throws on the
+// same UTF-8 rule as everything else for driver-supplied device names: the
+// fallback is an empty JSON array, which availableBackends() parses into an
+// empty list rather than a null it doesn't expect.
+//
+// llama.rn 0.13 also dropped deviceDescription, so it is filled here from the
+// device whose name matches deviceName.
 static jstring listBackends_impl(JNIEnv* env)
 {
-    std::string info = rnllama::backend_devices_info();
+    auto devices = rnllama::backend_devices_info();
+    const size_t dev_count = lm_ggml_backend_dev_count();
+    for (auto& device : devices) {
+        std::string description;
+        const std::string name = device.value("deviceName", "");
+        for (size_t i = 0; i < dev_count; i++) {
+            lm_ggml_backend_dev_t dev = lm_ggml_backend_dev_get(i);
+            if (dev == nullptr) continue;
+            const char* dev_name = lm_ggml_backend_dev_name(dev);
+            if (dev_name == nullptr || name != dev_name) continue;
+            const char* dev_description = lm_ggml_backend_dev_description(dev);
+            description = dev_description ? dev_description : "";
+            break;
+        }
+        device["deviceDescription"] = description;
+    }
+    std::string info = devices.dump();
     LOGI("nativeListBackends: %s", info.c_str());
     return std_to_jstring(env, info);
 }
